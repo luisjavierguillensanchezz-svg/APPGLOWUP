@@ -9,6 +9,7 @@ import libsql_client
 from google import genai
 from pydantic import BaseModel
 
+# --- LECTURA SEGURA DE SECRETS ---
 TURSO_URL = st.secrets.get("TURSO_DATABASE_URL", os.environ.get("TURSO_DATABASE_URL", ""))
 TURSO_TOKEN = st.secrets.get("TURSO_AUTH_TOKEN", os.environ.get("TURSO_AUTH_TOKEN", ""))
 GEMINI_KEY = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
@@ -58,6 +59,7 @@ def ensure_tables():
 
 ensure_tables()
 
+# --- MODELO PYDANTIC Y PARSER ---
 class MealEstimate(BaseModel):
     summary: str
     total_calories: float
@@ -93,6 +95,7 @@ def parse_meal(text: str) -> MealEstimate:
 
     raise RuntimeError(f"Error con el servicio de IA: {last_err}")
 
+# --- CONFIGURACIÓN DE PÁGINA ---
 st.set_page_config(page_title="Hypertrophy Tracker", layout="wide")
 today_str = str(date.today())
 
@@ -178,8 +181,8 @@ with tab_charts:
                 df_meals = pd.DataFrame(meals_res.rows, columns=["date", "total_cal", "total_prot"])
                 fig_cal = px.bar(df_meals, x="date", y="total_cal", title="Consumo Calórico Diario")
                 fig_prot = px.bar(df_meals, x="date", y="total_prot", title="Consumo de Proteína Diaria (g)")
-                st.plotly_chart(fig_cal, use_container_width=True)
-                st.plotly_chart(fig_prot, use_container_width=True)
+                st.plotly_chart(fig_cal, width="stretch")
+                st.plotly_chart(fig_prot, width="stretch")
             else:
                 st.info("Aún no hay registros de comidas para graficar.")
 
@@ -188,7 +191,7 @@ with tab_charts:
                 selected_ex = st.selectbox("Ejercicio para sobrecarga progresiva:", df_work["exercise"].unique())
                 df_ex = df_work[df_work["exercise"] == selected_ex]
                 fig_strength = px.line(df_ex, x="date", y="top_weight", markers=True, title=f"Sobrecarga: {selected_ex} (Carga máx kg)")
-                st.plotly_chart(fig_strength, use_container_width=True)
+                st.plotly_chart(fig_strength, width="stretch")
             else:
                 st.info("Aún no hay entrenamientos registrados para graficar.")
         except Exception as e:
