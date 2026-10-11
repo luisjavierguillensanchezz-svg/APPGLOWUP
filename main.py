@@ -68,7 +68,7 @@ class MealEstimate(BaseModel):
 def parse_meal(text: str) -> MealEstimate:
     prompt = f"Analiza para hipertrofia: '{text}'. Calcula calorías y macronutrientes estimados totales."
     response = ai_client.models.generate_content(
-        model='gemini-2.0-flash',
+        model='gemini-2.5-flash',
         contents=prompt,
         config=dict(
             response_mime_type="application/json",
