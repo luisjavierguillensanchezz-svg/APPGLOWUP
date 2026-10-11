@@ -1,17 +1,20 @@
 import os
+import time
+import json
+from datetime import date
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from datetime import date
 import libsql_client
 from google import genai
 from pydantic import BaseModel
 
-# Credenciales seguras
+# --- LECTURA SEGURA DE SECRETS ---
 TURSO_URL = st.secrets.get("TURSO_DATABASE_URL", os.environ.get("TURSO_DATABASE_URL", ""))
 TURSO_TOKEN = st.secrets.get("TURSO_AUTH_TOKEN", os.environ.get("TURSO_AUTH_TOKEN", ""))
 GEMINI_KEY = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
 
+# Cliente Gemini
 ai_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 
 def get_db():
@@ -55,9 +58,10 @@ def ensure_tables():
     finally:
         db.close()
 
-# Ejecuta la comprobación/creación de tablas
+# Inicialización de esquema
 ensure_tables()
 
+# --- MODELO PYDANTIC Y PARSER CON REINTENTO Y FALLBACK ---
 class MealEstimate(BaseModel):
     summary: str
     total_calories: float
@@ -67,17 +71,37 @@ class MealEstimate(BaseModel):
 
 def parse_meal(text: str) -> MealEstimate:
     prompt = f"Analiza para hipertrofia: '{text}'. Calcula calorías y macronutrientes estimados totales."
-    response = ai_client.models.generate_content(
-        model='gemini-3.8-flash',
-        contents=prompt,
-        config=dict(
-            response_mime_type="application/json",
-            response_schema=MealEstimate,
-            temperature=0.1
-        )
-    )
-    return MealEstimate.model_validate_json(response.text)
+    
+    # Modelos candidatos en orden de preferencia
+    candidates = ['gemini-3.8-flash', 'gemini-2.5-flash']
+    last_err = None
 
+    for model_name in candidates:
+        for attempt in range(2):
+            try:
+                response = ai_client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=dict(
+                        response_mime_type="application/json",
+                        response_schema=MealEstimate,
+                        temperature=0.1
+                    )
+                )
+                return MealEstimate.model_validate_json(response.text)
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                # Si está congestionado (503), espera antes de reintentar
+                if "503" in err_str:
+                    time.sleep(2)
+                    continue
+                # Si es 404 u otro error, pasa al siguiente modelo
+                break
+
+    raise RuntimeError(f"No fue posible conectar con los servidores de IA: {last_err}")
+
+# --- CONFIGURACIÓN DE PÁGINA ---
 st.set_page_config(page_title="Hypertrophy Tracker", layout="wide")
 today_str = str(date.today())
 
@@ -92,7 +116,7 @@ with tab_input:
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("Nutrición (Voz / Texto)")
+        st.subheader("🍗 Nutrición (Voz / Texto)")
         meal_text = st.text_area("Comida (ej. '4 huevos con 2 tortillas y licuado de 30g de proteína'):")
         if st.button("Calcular y Guardar Comida"):
             if meal_text and ai_client and TURSO_URL:
@@ -198,7 +222,6 @@ with tab_backup:
                     "workouts": [list(r) for r in w],
                     "daily_metrics": [list(r) for r in d]
                 }
-                import json
                 st.download_button(
                     label="Descargar archivo JSON",
                     data=json.dumps(backup_data, indent=2),
