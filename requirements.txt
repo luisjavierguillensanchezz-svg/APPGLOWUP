@@ -1,0 +1,6 @@
+streamlit
+libsql-client
+google-genai
+pydantic
+pandas
+plotly
