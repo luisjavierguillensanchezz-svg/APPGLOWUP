@@ -68,7 +68,7 @@ class MealEstimate(BaseModel):
 def parse_meal(text: str) -> MealEstimate:
     prompt = f"Analiza para hipertrofia: '{text}'. Calcula calorías y macronutrientes estimados totales."
     response = ai_client.models.generate_content(
-        model='gemini-1.5-flash',
+        model='model='gemini-2.0-flash',',
         contents=prompt,
         config=dict(
             response_mime_type="application/json",
@@ -92,7 +92,7 @@ with tab_input:
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("🍗 Nutrición (Voz / Texto)")
+        st.subheader("Nutrición (Voz / Texto)")
         meal_text = st.text_area("Comida (ej. '4 huevos con 2 tortillas y licuado de 30g de proteína'):")
         if st.button("Calcular y Guardar Comida"):
             if meal_text and ai_client and TURSO_URL:
