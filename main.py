@@ -40,6 +40,7 @@ import sqlite3
 import threading
 import time
 import unicodedata
+import requests
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 
@@ -338,7 +339,7 @@ def dl_w():
 
 
 # =============================================================================
-# 3. BASE DE DATOS (Turso/libSQL o SQLite local)
+# 3. BASE DE DATOS (Turso/libSQL o SQLite local) CON INTERCEPTOR DE ERRORES
 # =============================================================================
 SCHEMA = [
     # --- tablas originales (se conservan) ---
@@ -407,7 +408,8 @@ class Store:
         url, token = secret("TURSO_DATABASE_URL"), secret("TURSO_AUTH_TOKEN")
         if url and token and libsql_client is not None:
             self.mode = "turso"
-            self.url = url.replace("libsql://", "https://")
+            # Limpiamos slashes extra que causan el error
+            self.url = url.replace("libsql://", "https://").rstrip("/")
             self.token = token
         else:
             self.mode = "local"
@@ -449,13 +451,29 @@ class Store:
                 cols = [d[0] for d in cur.description] if cur.description else []
                 self.conn.commit()
                 return Result(rows, cols, cur.lastrowid)
+            
             last = None
             for _ in range(2):
                 try:
                     rs = self._get_client().execute(sql, params)
                     return Result([tuple(r) for r in rs.rows], list(rs.columns),
                                   getattr(rs, "last_insert_rowid", None))
-                except Exception as e:  # reconecta y reintenta una vez
+                except KeyError as e:
+                    # INTERCEPTOR DE ERRORES: Si la librería falla con 'result', le preguntamos a Turso directamente el motivo
+                    if "result" in str(e):
+                        try:
+                            u = self.url + "/v2/pipeline"
+                            h = {"Authorization": f"Bearer {self.token}"}
+                            b = {"requests": [{"type": "execute", "stmt": {"sql": "SELECT 1", "args": []}}]}
+                            resp = requests.post(u, json=b, headers=h)
+                            raise RuntimeError(f"🚨 Rechazo de Turso. Respuesta exacta del servidor: {resp.text}")
+                        except Exception as req_e:
+                            if "Respuesta exacta" in str(req_e):
+                                raise req_e
+                            raise RuntimeError(f"Turso rechazó la conexión y falló la lectura del error: {req_e}")
+                    last = e
+                    self._reset()
+                except Exception as e:
                     last = e
                     self._reset()
             raise last
