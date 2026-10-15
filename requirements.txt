@@ -1,6 +1,7 @@
-streamlit
-pandas
-plotly
+streamlit>=1.50
+pandas>=2.0
+plotly>=5.20
+pydantic>=2.0
+requests
 google-genai
-pydantic
-libsql-client>=0.1.0
+tzdata
