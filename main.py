@@ -15,6 +15,7 @@ Qué incluye
 * Dashboard de 8 semanas, gráficas con fechas reales y ejes honestos.
 * Nutrición con exceso de meta visible, sueño/recuperación, peso y cintura.
 * Exportación CSV/JSON.
+* Semana de entrenamiento: sábado = Día 1 UPPER … viernes = Día 7 DESCANSO.
 
 Datos
 -----
@@ -251,8 +252,17 @@ def parse_iso(s):
     return dt if dt.tzinfo else dt.replace(tzinfo=tz())
 
 
-def monday_of(d):
-    return d - timedelta(days=d.weekday())
+WEEK_START = 5  # sábado: Día 1 UPPER; el viernes es el Día 7 (descanso total)
+
+
+def week_start_of(d):
+    """Sábado en o antes de la fecha d (inicio de la semana de entrenamiento)."""
+    return d - timedelta(days=(d.weekday() - WEEK_START) % 7)
+
+
+def day_index(d):
+    """0 = sábado (Día 1) … 6 = viernes (Día 7)."""
+    return (d.weekday() - WEEK_START) % 7
 
 
 def fecha_es(d):
@@ -539,7 +549,13 @@ class Store:
         self.execute("INSERT OR IGNORE INTO users (id, name, created_at) VALUES (?, ?, ?)", [UID, "Luis", iso()])
         if not self.execute("SELECT 1 FROM programs WHERE id=?", [PROGRAM_ID]).rows:
             self.execute("INSERT INTO programs (id, user_id, name, start_date, weeks, active) VALUES (?,?,?,?,?,1)",
-                         [PROGRAM_ID, UID, "Hipertrofia 8 semanas", str(monday_of(today())), WEEKS])
+                         [PROGRAM_ID, UID, "Hipertrofia 8 semanas", str(week_start_of(today())), WEEKS])
+        # Migración: si el inicio guardado no cae en sábado (versiones anteriores usaban lunes), se ajusta.
+        r = self.execute("SELECT start_date FROM programs WHERE id=?", [PROGRAM_ID]).rows
+        if r and r[0][0]:
+            stored = date.fromisoformat(r[0][0])
+            if stored != week_start_of(stored):
+                self.execute("UPDATE programs SET start_date=? WHERE id=?", [str(week_start_of(stored)), PROGRAM_ID])
 
 
 @st.cache_resource(show_spinner=False)
@@ -622,7 +638,7 @@ def unit():
 def program_start():
     if "_pstart" not in st.session_state:
         r = q1("SELECT start_date FROM programs WHERE id=?", [PROGRAM_ID])
-        st.session_state["_pstart"] = date.fromisoformat(r[0]) if r and r[0] else monday_of(today())
+        st.session_state["_pstart"] = week_start_of(date.fromisoformat(r[0])) if r and r[0] else week_start_of(today())
     return st.session_state["_pstart"]
 
 
@@ -631,7 +647,7 @@ def week_number(d, start=None):
 
 
 def suggested_day():
-    return DAY_KEYS[today().weekday()]
+    return DAY_KEYS[day_index(today())]
 
 
 def ex_cfg():
@@ -1296,11 +1312,11 @@ def cb_save_body():
 
 
 def cb_save_program():
-    start = monday_of(st.session_state["pl_start"])
+    start = week_start_of(st.session_state["pl_start"])
     x("UPDATE programs SET start_date=? WHERE id=?", [str(start), PROGRAM_ID])
     st.session_state["_pstart"] = start
     bump(True)
-    st.toast(f"Bloque iniciado el lunes {start.day} de {MESES[start.month - 1]}")
+    st.toast(f"Bloque iniciado el sábado {start.day} de {MESES[start.month - 1]}")
 
 
 def cb_unit_change():
@@ -1639,7 +1655,7 @@ def view_home():
     elif wk > WEEKS:
         prog, frac = f"Bloque de {WEEKS} semanas finalizado", 1.0
     else:
-        prog, frac = f"Semana {wk} de {WEEKS}", ((wk - 1) + (d.weekday() + 1) / 7) / WEEKS
+        prog, frac = f"Semana {wk} de {WEEKS}", ((wk - 1) + (day_index(d) + 1) / 7) / WEEKS
     rest_day = day["slug"] == "d7"
     H(f'<div class="gx-card"><div class="gx-muted">{esc(fecha_es(d))}</div>'
       f'<div class="gx-h1">Hola, {esc(s.get("name", "Luis"))}</div>'
@@ -2445,7 +2461,7 @@ def view_nutrition():
     style_time_axis(fig, m["date"])
     show_chart(fig, "nu_prot")
     wk = md.copy()
-    wk["sem"] = wk["date"].dt.to_period("W-SUN").apply(lambda p: p.start_time)
+    wk["sem"] = wk["date"].map(lambda t: pd.Timestamp(week_start_of(t.date())))
     agg = wk.groupby("sem").agg(Kcal=("cal", "mean"), Proteina=("prot", "mean"), Carbs=("carbs", "mean"), Grasas=("fat", "mean"),
                                 Dias=("cal", "size")).reset_index().sort_values("sem", ascending=False).head(8)
     agg["Semana"] = agg["sem"].map(lambda t: fecha_corta(t.date()))
@@ -2527,7 +2543,7 @@ def view_plan():
 
     H('<div class="gx-title" style="margin:14px 0 6px">Bloque de entrenamiento</div>')
     start = program_start()
-    st.date_input("Inicio del bloque (se ajusta al lunes de esa semana)", start, key="pl_start")
+    st.date_input("Inicio del bloque (sábado de Día 1 UPPER; se ajusta al sábado anterior o igual)", start, key="pl_start")
     st.button("Guardar inicio del bloque", key="pl_start_btn", on_click=cb_save_program, **btn_w())
     wk = week_number(d)
     st.caption(f"Hoy es la semana {wk} de {WEEKS}." if 1 <= wk <= WEEKS else
