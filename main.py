@@ -15,13 +15,15 @@ Qué incluye
 * Dashboard de 8 semanas, gráficas con fechas reales y ejes honestos.
 * Nutrición con exceso de meta visible, sueño/recuperación, peso y cintura.
 * Exportación CSV/JSON.
-* Semana de entrenamiento: sábado = Día 1 UPPER … viernes = Día 7 DESCANSO.
+* La semana de entrenamiento empieza en SÁBADO (Día 1 = sábado … Día 7 = viernes).
 
 Datos
 -----
 Conserva las tablas originales (meals, workouts, daily_metrics). La tabla antigua
 `workouts` ya no se escribe, pero se sigue LEYENDO como historial (se asume en kg).
 Si no hay credenciales de Turso se usa un SQLite local (temporal en la nube).
+Si el inicio del bloque guardado no cae en sábado, se mueve automáticamente al
+sábado anterior.
 
 Secrets / variables de entorno
 ------------------------------
@@ -41,6 +43,7 @@ import sqlite3
 import threading
 import time
 import unicodedata
+import requests
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 
@@ -50,6 +53,10 @@ import streamlit as st
 import streamlit.components.v1 as components
 from pydantic import BaseModel
 
+try:  # modo local si no está instalado
+    import libsql_client
+except ImportError:  # pragma: no cover
+    libsql_client = None
 try:
     from google import genai
 except ImportError:  # pragma: no cover
@@ -62,6 +69,7 @@ UID = "luis"
 PROGRAM_ID = "hipertrofia-8s"
 WEEKS = 8
 SESSIONS_PER_WEEK = 6          # días 1-6 (el 7 es descanso total)
+WEEK_START = 5                 # 0=lunes … 5=sábado: la semana empieza en sábado
 KG_PER_LB = 0.45359237
 
 C_BG, C_CARD, C_CARD2, C_BORDER = "#0E1118", "#171B25", "#1E2330", "#2A2F3F"
@@ -80,6 +88,8 @@ REST_BY_KIND = {"heavy": 240, "compound": 180, "iso": 90, "activity": 0}
 # =============================================================================
 # 1. PLAN DE ENTRENAMIENTO (8 semanas, progresión doble)
 #    Series / rangos / RIR son valores iniciales editables aquí.
+#    El orden de DAYS sigue la semana: Día 1 = sábado, Día 2 = domingo, …,
+#    Día 7 = viernes.
 # =============================================================================
 def _ex(name, group, muscle, sets, rmin, rmax, rir, kind, inc=2.5, rest=None):
     return dict(name=name, group=group, muscle=muscle, sets=sets, rmin=rmin, rmax=rmax,
@@ -197,21 +207,6 @@ def secret(name, default=""):
     return v if v not in (None, "") else os.environ.get(name, default)
 
 
-def secrets_status():
-    """Qué secrets detecta la app (solo sí/no, nunca los valores) y si están dentro de una sección."""
-    names = ["TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN", "GEMINI_API_KEY"]
-    found = {n: bool(secret(n)) for n in names}
-    nested = []
-    try:
-        for k in st.secrets.keys():
-            v = st.secrets[k]
-            if hasattr(v, "keys") and any(n in v for n in names):
-                nested.append(str(k))
-    except Exception:
-        pass
-    return found, nested
-
-
 _TZ = None
 
 
@@ -252,17 +247,19 @@ def parse_iso(s):
     return dt if dt.tzinfo else dt.replace(tzinfo=tz())
 
 
-WEEK_START = 5  # sábado: Día 1 UPPER; el viernes es el Día 7 (descanso total)
-
-
 def week_start_of(d):
-    """Sábado en o antes de la fecha d (inicio de la semana de entrenamiento)."""
+    """Primer día (sábado) de la semana de entrenamiento que contiene a d."""
     return d - timedelta(days=(d.weekday() - WEEK_START) % 7)
 
 
 def day_index(d):
-    """0 = sábado (Día 1) … 6 = viernes (Día 7)."""
+    """Posición del día dentro de la semana: 0 = sábado (Día 1) … 6 = viernes (Día 7)."""
     return (d.weekday() - WEEK_START) % 7
+
+
+def weekday_name_for(day_key):
+    """Nombre del día de la semana que corresponde a cada 'Día N' del plan."""
+    return DIAS_ES[(WEEK_START + DAY_KEYS.index(day_key)) % 7]
 
 
 def fecha_es(d):
@@ -359,7 +356,7 @@ def dl_w():
 
 
 # =============================================================================
-# 3. BASE DE DATOS (Turso/libSQL o SQLite local)
+# 3. BASE DE DATOS (Turso/libSQL o SQLite local) CON INTERCEPTOR DE ERRORES
 # =============================================================================
 SCHEMA = [
     # --- tablas originales (se conservan) ---
@@ -421,53 +418,16 @@ class Result:
         self.rows, self.cols, self.lastrowid = rows, cols, lastrowid
 
 
-def _hrana_arg(p):
-    """Python -> valor Hrana."""
-    if p is None:
-        return {"type": "null"}
-    if isinstance(p, bool):
-        return {"type": "integer", "value": str(int(p))}
-    if isinstance(p, int):
-        return {"type": "integer", "value": str(p)}
-    if isinstance(p, float):
-        return {"type": "float", "value": p}
-    if isinstance(p, (bytes, bytearray)):
-        import base64
-        return {"type": "blob", "base64": base64.b64encode(bytes(p)).decode()}
-    return {"type": "text", "value": str(p)}
-
-
-def _hrana_val(v):
-    """Valor Hrana -> Python."""
-    t = v.get("type")
-    if t == "null":
-        return None
-    if t == "integer":
-        return int(v["value"])
-    if t == "float":
-        return float(v["value"])
-    if t == "blob":
-        import base64
-        return base64.b64decode(v.get("base64", ""))
-    return v.get("value")
-
-
 class Store:
-    """Turso por HTTP directo (sin libsql_client) o SQLite local como respaldo."""
-
     def __init__(self):
         self.lock = threading.RLock()
-        self._sess = None
+        self._client = None
         url, token = secret("TURSO_DATABASE_URL"), secret("TURSO_AUTH_TOKEN")
-        if url and token:
+        if url and token and libsql_client is not None:
             self.mode = "turso"
-            u = str(url).strip().rstrip("/")
-            for pre in ("libsql://", "wss://", "ws://"):
-                if u.startswith(pre):
-                    u = "https://" + u[len(pre):]
-            if not u.startswith("http"):
-                u = "https://" + u
-            self.url, self.token = u, str(token).strip()
+            # Limpiamos slashes extra que causan el error
+            self.url = url.replace("libsql://", "https://").rstrip("/")
+            self.token = token
         else:
             self.mode = "local"
             self.conn = sqlite3.connect(secret("GAINS_DB_PATH", "gains_local.db"), check_same_thread=False)
@@ -486,46 +446,18 @@ class Store:
             return p.isoformat()
         return p
 
-    def _session(self):
-        if self._sess is None:
-            import requests
-            self._sess = requests.Session()
-            self._sess.headers.update({"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
-        return self._sess
+    def _get_client(self):
+        if self._client is None:
+            self._client = libsql_client.create_client_sync(url=self.url, auth_token=self.token)
+        return self._client
 
     def _reset(self):
         try:
-            if self._sess is not None:
-                self._sess.close()
+            if self._client is not None:
+                self._client.close()
         except Exception:
             pass
-        self._sess = None
-
-    def _http(self, sql, params):
-        import requests
-        body = {"requests": [{"type": "execute", "stmt": {"sql": sql, "args": [_hrana_arg(p) for p in params]}},
-                             {"type": "close"}]}
-        last = None
-        for _ in range(2):  # solo se reintenta ante fallos de red, nunca ante errores SQL
-            try:
-                r = self._session().post(self.url + "/v2/pipeline", json=body, timeout=25)
-                break
-            except requests.RequestException as e:
-                last = e
-                self._reset()
-        else:
-            raise RuntimeError(f"No hay conexión con Turso: {last}")
-        if r.status_code != 200:
-            raise RuntimeError(f"Turso respondió HTTP {r.status_code}: {r.text[:300]}")
-        res = r.json()["results"][0]
-        if res.get("type") != "ok":
-            err = res.get("error") or {}
-            raise RuntimeError(f"Error SQL en Turso: {err.get('message', res)}")
-        result = res["response"]["result"]
-        cols = [c.get("name") for c in result.get("cols", [])]
-        rows = [tuple(_hrana_val(v) for v in row) for row in result.get("rows", [])]
-        lid = result.get("last_insert_rowid")
-        return Result(rows, cols, int(lid) if lid not in (None, "") else None)
+        self._client = None
 
     def execute(self, sql, params=()):
         params = [self._clean(p) for p in params]
@@ -536,7 +468,32 @@ class Store:
                 cols = [d[0] for d in cur.description] if cur.description else []
                 self.conn.commit()
                 return Result(rows, cols, cur.lastrowid)
-            return self._http(sql, params)
+
+            last = None
+            for _ in range(2):
+                try:
+                    rs = self._get_client().execute(sql, params)
+                    return Result([tuple(r) for r in rs.rows], list(rs.columns),
+                                  getattr(rs, "last_insert_rowid", None))
+                except KeyError as e:
+                    # INTERCEPTOR DE ERRORES: Si la librería falla con 'result', le preguntamos a Turso directamente el motivo
+                    if "result" in str(e):
+                        try:
+                            u = self.url + "/v2/pipeline"
+                            h = {"Authorization": f"Bearer {self.token}"}
+                            b = {"requests": [{"type": "execute", "stmt": {"sql": "SELECT 1", "args": []}}]}
+                            resp = requests.post(u, json=b, headers=h)
+                            raise RuntimeError(f"🚨 Rechazo de Turso. Respuesta exacta del servidor: {resp.text}")
+                        except Exception as req_e:
+                            if "Respuesta exacta" in str(req_e):
+                                raise req_e
+                            raise RuntimeError(f"Turso rechazó la conexión y falló la lectura del error: {req_e}")
+                    last = e
+                    self._reset()
+                except Exception as e:
+                    last = e
+                    self._reset()
+            raise last
 
     def init_schema(self):
         for s in SCHEMA:
@@ -547,15 +504,19 @@ class Store:
             except Exception:
                 pass
         self.execute("INSERT OR IGNORE INTO users (id, name, created_at) VALUES (?, ?, ?)", [UID, "Luis", iso()])
-        if not self.execute("SELECT 1 FROM programs WHERE id=?", [PROGRAM_ID]).rows:
+        r = self.execute("SELECT start_date FROM programs WHERE id=?", [PROGRAM_ID]).rows
+        if not r:
             self.execute("INSERT INTO programs (id, user_id, name, start_date, weeks, active) VALUES (?,?,?,?,?,1)",
                          [PROGRAM_ID, UID, "Hipertrofia 8 semanas", str(week_start_of(today())), WEEKS])
-        # Migración: si el inicio guardado no cae en sábado (versiones anteriores usaban lunes), se ajusta.
-        r = self.execute("SELECT start_date FROM programs WHERE id=?", [PROGRAM_ID]).rows
-        if r and r[0][0]:
-            stored = date.fromisoformat(r[0][0])
-            if stored != week_start_of(stored):
-                self.execute("UPDATE programs SET start_date=? WHERE id=?", [str(week_start_of(stored)), PROGRAM_ID])
+        elif r[0][0]:
+            # Migración: la semana ahora empieza en sábado. Si el inicio guardado no es sábado,
+            # se mueve al sábado anterior para que los números de semana cuadren.
+            try:
+                s = date.fromisoformat(str(r[0][0]))
+                if s.weekday() != WEEK_START:
+                    self.execute("UPDATE programs SET start_date=? WHERE id=?", [str(week_start_of(s)), PROGRAM_ID])
+            except ValueError:
+                pass
 
 
 @st.cache_resource(show_spinner=False)
@@ -638,7 +599,7 @@ def unit():
 def program_start():
     if "_pstart" not in st.session_state:
         r = q1("SELECT start_date FROM programs WHERE id=?", [PROGRAM_ID])
-        st.session_state["_pstart"] = week_start_of(date.fromisoformat(r[0])) if r and r[0] else week_start_of(today())
+        st.session_state["_pstart"] = date.fromisoformat(r[0]) if r and r[0] else week_start_of(today())
     return st.session_state["_pstart"]
 
 
@@ -647,6 +608,7 @@ def week_number(d, start=None):
 
 
 def suggested_day():
+    """Sábado → Día 1, domingo → Día 2, …, viernes → Día 7."""
     return DAY_KEYS[day_index(today())]
 
 
@@ -773,6 +735,38 @@ def recommend(sessions, rmin, rmax, target_sets, target_rir, inc):
     top = sum(r >= rmax for r in reps)
     return keep(f"{top} de {n} series llegaron a {rmax} repeticiones. Mantén {fmt_w(w)} e intenta llegar "
                 f"al tope en todas las series.")
+
+
+def session_from_sets(sets):
+    """Arma una 'sesión' (mismo formato que summarize_sessions) a partir de series en curso."""
+    sets = [dict(w=float(z["w"]), reps=int(z["reps"]), rir=z["rir"]) for z in sets]
+    if not sets:
+        return None
+    cnt = Counter(z["w"] for z in sets)
+    return dict(sets=sets, weight=max(cnt.items(), key=lambda kv: (kv[1], kv[0]))[0])
+
+
+def overload_check(session, rmin, rmax, target_sets, target_rir):
+    """¿Toca subir la carga? Evalúa la progresión doble criterio por criterio.
+
+    Usa los mismos criterios que recommend(): todas las series prescritas con la carga
+    de trabajo, todas en el tope del rango y todas con el RIR objetivo (registrado).
+    """
+    w = session["weight"]
+    work = [z for z in session["sets"] if abs(z["w"] - w) < 1e-6]
+    n = len(work)
+    reps = [z["reps"] for z in work]
+    rirs = [z["rir"] for z in work]
+    at_top = sum(r >= rmax for r in reps)
+    checks = [
+        (f"Series con {fmt_w(w)}: {min(n, target_sets)} de {target_sets}", n >= target_sets),
+        (f"Todas con al menos {rmin} reps", bool(reps) and min(reps) >= rmin),
+        (f"Series en el tope ({rmax} reps): {min(at_top, target_sets)} de {target_sets}",
+         n >= target_sets and at_top >= n),
+        ("RIR registrado en todas", bool(rirs) and all(r is not None for r in rirs)),
+        (f"RIR {target_rir} o más en todas", bool(rirs) and all(r is not None and r >= target_rir for r in rirs)),
+    ]
+    return dict(weight=w, ready=all(ok for _, ok in checks), checks=checks, at_top=at_top, n=n)
 
 
 def compare_sessions(prev, cur):
@@ -1399,15 +1393,37 @@ def ai_client():
     return genai.Client(api_key=key) if (key and genai is not None) else None
 
 
-def parse_meal(text):
+class QuotaError(RuntimeError):
+    """Cuota de Gemini agotada (se muestra con un mensaje claro, sin el JSON crudo)."""
+
+
+def _retry_seconds(err_text):
+    m = re.search(r"retryDelay['\"]?\s*:\s*['\"]?(\d+(?:\.\d+)?)s", err_text)
+    if m:
+        return float(m.group(1))
+    m = re.search(r"retry in (?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?", err_text)
+    if m and any(m.groups()):
+        h, mi, se = (float(g) if g else 0.0 for g in m.groups())
+        return h * 3600 + mi * 60 + se
+    return None
+
+
+def _norm_meal_text(text):
+    return re.sub(r"\s+", " ", str(text).strip().lower())
+
+
+@st.cache_data(ttl=7 * 24 * 3600, show_spinner=False, max_entries=500)
+def _parse_meal_cached(text_norm, models_csv):
+    """Llama a Gemini. Resultado en caché: analizar el mismo texto otra vez no gasta cuota.
+    Los errores no se guardan en caché."""
     client = ai_client()
     if client is None:
         raise RuntimeError("Falta GEMINI_API_KEY (o la librería google-genai).")
-    prompt = f"Analiza para hipertrofia: '{text}'. Desglosa por ingredientes y da el total de macros."
-    candidates = [m.strip() for m in secret("GEMINI_MODELS", "gemini-flash-latest,gemini-3.8-flash").split(",") if m.strip()]
-    last_err = None
+    prompt = f"Analiza para hipertrofia: '{text_norm}'. Desglosa por ingredientes y da el total de macros."
+    candidates = [m.strip() for m in models_csv.split(",") if m.strip()]
+    last_err, quota_models, waits = None, [], []
     for model_name in candidates:
-        for wait_time in (1, 2):
+        for attempt in range(2):
             try:
                 resp = client.models.generate_content(
                     model=model_name, contents=prompt,
@@ -1419,14 +1435,36 @@ def parse_meal(text):
                     est.total_protein_g = round(sum(i.protein_g for i in est.items), 1)
                     est.total_carbs_g = round(sum(i.carbs_g for i in est.items), 1)
                     est.total_fat_g = round(sum(i.fat_g for i in est.items), 1)
-                return est
+                return est.model_dump()
             except Exception as e:
-                last_err = e
-                if any(c in str(e) for c in ("503", "UNAVAILABLE", "429")):
-                    time.sleep(wait_time)
+                last_err, txt = e, str(e)
+                if "429" in txt or "RESOURCE_EXHAUSTED" in txt:
+                    wait = _retry_seconds(txt)
+                    daily = "PerDay" in txt or (wait is not None and wait > 60)
+                    if daily or attempt == 1:
+                        # Cuota diaria: reintentar no sirve; se pasa al siguiente modelo.
+                        quota_models.append(model_name)
+                        if wait:
+                            waits.append(wait)
+                        break
+                    time.sleep(min(wait or 2, 10))
+                    continue
+                if "503" in txt or "UNAVAILABLE" in txt:
+                    time.sleep(2)
                     continue
                 break
+    if quota_models and len(quota_models) == len(candidates):
+        when = f" Se renueva en aproximadamente {hms(min(waits))}." if waits else ""
+        raise QuotaError(
+            f"Se agotó la cuota gratuita de Gemini para hoy ({', '.join(quota_models)}).{when} "
+            "Mientras tanto usa el registro manual; o agrega otro modelo en el secret GEMINI_MODELS "
+            "(cada modelo tiene su propia cuota) o activa la facturación en Google AI Studio.")
     raise RuntimeError(f"Error IA: {last_err}")
+
+
+def parse_meal(text):
+    models = secret("GEMINI_MODELS", "gemini-flash-latest,gemini-3.8-flash")
+    return MealEstimate.model_validate(_parse_meal_cached(_norm_meal_text(text), models))
 
 
 # =============================================================================
@@ -1506,6 +1544,19 @@ div[role="radiogroup"] > label:has(input:checked) p {{color:{C_CORAL} !important
 .gx-week {{background:{C_CARD}; border:1px solid {C_BORDER}; border-radius:12px; padding:10px; font-size:12px; color:#D5DAE6;}}
 .gx-week b {{color:#fff;}}
 .gx-up {{color:{C_GREEN};}} .gx-down {{color:{C_ORANGE};}}
+/* Evaluación de sobrecarga progresiva */
+.gx-check {{font-size:12px; color:{C_MUTED}; margin-top:4px;}}
+.gx-check.ok {{color:{C_GREEN};}}
+.gx-ready {{border-color:rgba(52,211,153,.55) !important;}}
+/* Tira de la semana (sábado → viernes) */
+.gx-strip {{display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:4px; margin-top:10px;}}
+.gx-day {{background:{C_CARD2}; border-radius:10px; padding:6px 2px; text-align:center; font-size:10px; color:{C_MUTED};
+  border:1px solid transparent;}}
+.gx-day b {{display:block; font-size:12px; color:#fff;}}
+.gx-day.today {{border-color:{C_CORAL};}}
+.gx-day.done {{background:rgba(52,211,153,.15);}}
+.gx-day.done b {{color:{C_GREEN};}}
+.gx-day.rest b {{color:{C_MUTED};}}
 </style>
 """
 
@@ -1543,9 +1594,43 @@ def macro_bar(label, value, goal, unit_, color):
             f'<div class="gx-muted">{over_txt}</div></div>')
 
 
+def overload_card(chk, title, inc, u, subtitle=""):
+    """Tarjeta '¿Toca subir?' con cada criterio marcado."""
+    items = "".join(f'<div class="gx-check {"ok" if ok else ""}">{"✓" if ok else "○"} {esc(t)}</div>'
+                    for t, ok in chk["checks"])
+    if chk["ready"]:
+        verdict = badge("Sí, toca subir", "ok")
+        foot = (f'<div class="gx-text"><b>Próxima carga: {fmt_w(chk["weight"] + inc)} {u}</b> '
+                f'(+{fmt_w(inc)}) si la técnica fue buena.</div>')
+    else:
+        verdict = badge("Todavía no", "pend")
+        foot = f'<div class="gx-text">Mantén {fmt_w(chk["weight"])} {u} hasta cumplir todos los puntos.</div>'
+    sub = f'<div class="gx-muted">{esc(subtitle)}</div>' if subtitle else ""
+    return (f'<div class="gx-card {"gx-ready" if chk["ready"] else ""}" style="padding:10px">'
+            f'<div class="gx-row"><div class="gx-title">{esc(title)}</div>{verdict}</div>{sub}{items}{foot}</div>')
+
+
 def plain_bar(frac, color=C_BLUE):
     frac = max(0.0, min(1.0, frac))
     return f'<div class="gx-track"><div style="width:{frac * 100:.1f}%;background:{color}"></div></div>'
+
+
+def week_strip(d, finished_dates):
+    """Tira de 7 días de la semana actual, de sábado a viernes."""
+    w0 = week_start_of(d)
+    cells = []
+    for i, key in enumerate(DAY_KEYS):
+        day_d = w0 + timedelta(days=i)
+        cls = ["gx-day"]
+        if day_d == d:
+            cls.append("today")
+        if str(day_d) in finished_dates:
+            cls.append("done")
+        if not DAYS[key]["exercises"]:
+            cls.append("rest")
+        short = key.split(":")[1].strip()[:5] if ":" in key else key[:5]
+        cells.append(f'<div class="{" ".join(cls)}">{DIAS_ES[day_d.weekday()][:3]}<b>{day_d.day}</b>{esc(short)}</div>')
+    return '<div class="gx-strip">' + "".join(cells) + "</div>"
 
 
 def base_layout(fig, height=280, legend=False):
@@ -1651,17 +1736,21 @@ def view_home():
     T = D["targets"]
 
     if wk < 1:
-        prog, frac = f"El bloque inicia el {fecha_corta(start)}", 0.0
+        prog, frac = f"El bloque inicia el sábado {fecha_corta(start)}", 0.0
     elif wk > WEEKS:
         prog, frac = f"Bloque de {WEEKS} semanas finalizado", 1.0
     else:
         prog, frac = f"Semana {wk} de {WEEKS}", ((wk - 1) + (day_index(d) + 1) / 7) / WEEKS
-    rest_day = day["slug"] == "d7"
+    rest_day = not day["exercises"]
+    w0 = week_start_of(d)
+    finished_dates = {str(r[0]) for r in q("SELECT date FROM sessions WHERE user_id=? AND status='finished' "
+                                             "AND date>=? AND date<=?", [UID, str(w0), str(w0 + timedelta(days=6))])}
     H(f'<div class="gx-card"><div class="gx-muted">{esc(fecha_es(d))}</div>'
       f'<div class="gx-h1">Hola, {esc(s.get("name", "Luis"))}</div>'
       f'<div class="gx-row" style="margin-top:8px"><span class="gx-title">{esc(prog)}</span>'
       f'<span class="gx-muted">{D["week_finished"]}/{SESSIONS_PER_WEEK} sesiones</span></div>{plain_bar(frac, C_BLUE)}'
-      f'<div style="margin-top:12px" class="gx-muted">Sesión de hoy</div>'
+      f'{week_strip(d, finished_dates)}'
+      f'<div style="margin-top:12px" class="gx-muted">Sesión de hoy ({esc(DIAS_ES[d.weekday()])})</div>'
       f'<div class="gx-title">{esc(day_key)}</div>'
       f'<div class="gx-muted">{"Descanso total: recuperar también es entrenar." if rest_day else str(len(day["exercises"])) + " ejercicios"}</div></div>')
     if not rest_day:
@@ -1673,6 +1762,7 @@ def view_home():
     adher = D["week_finished"] / SESSIONS_PER_WEEK * 100
     H(f'<div class="gx-card"><div class="gx-row"><span class="gx-title">Entrenamientos de la semana</span>'
       f'<span class="gx-muted">Adherencia {adher:.0f}%</span></div>'
+      f'<div class="gx-muted">Semana del sábado {esc(fecha_corta(w0))} al viernes {esc(fecha_corta(w0 + timedelta(days=6)))}</div>'
       f'<div class="gx-kpis three" style="margin-top:8px">{kpi("Completados", D["week_finished"])}'
       f'{kpi("Iniciados", D["week_started"])}{kpi("Programados", SESSIONS_PER_WEEK)}</div></div>')
 
@@ -1732,8 +1822,12 @@ def view_food():
                         est=dict(cal=est.total_calories, prot=est.total_protein_g, carbs=est.total_carbs_g,
                                  fat=est.total_fat_g),
                         items=[i.model_dump() for i in est.items])
+                except QuotaError as e:
+                    st.warning(str(e))
+                    st.session_state["_manual_open"] = True
                 except Exception as e:
                     st.error(str(e))
+                    st.session_state["_manual_open"] = True
     p = st.session_state.get("pending_meal")
     if p:
         H('<div class="gx-title" style="margin:8px 0 6px">Vista previa (aún no guardada)</div>')
@@ -1748,7 +1842,7 @@ def view_food():
         b1.button("Guardar comida", type="primary", key="btn_save_meal", on_click=cb_save_pending_meal, **btn_w())
         b2.button("Descartar", key="btn_discard_meal", on_click=cb_discard_meal, **btn_w())
 
-    with st.expander("Registro manual (sin IA)"):
+    with st.expander("Registro manual (sin IA)", expanded=st.session_state.get("_manual_open", False)):
         st.text_input("Descripción", key="mm_desc")
         a, b = st.columns(2)
         a.number_input("Calorías", 0.0, 5000.0, 0.0, 10.0, key="mm_cal")
@@ -1921,6 +2015,10 @@ def view_exercise(day, sid, d_str, sets_df, ex, auto_rest):
                 st.button("Confirmar", key=f"acc_{es}", on_click=cb_accept_target, type="primary",
                           args=(name, es, sid, rec["weight"],
                                 rec["last_weight"], rec["action"], rec["reason"], n_presc), **btn_w())
+        if last:
+            chk_last = overload_check(last, ex["rmin"], ex["rmax"], ex["sets"], ex["rir"])
+            H(overload_card(chk_last, "¿Toca subir?", inc, u,
+                            f"Según tu última sesión ({fecha_corta(last['date'])})"))
         if rec.get("fatigue"):
             st.warning("Tu volumen en este ejercicio bajó durante las últimas 3 sesiones. Antes de tocar la carga revisa "
                        "descanso entre series, sueño, calorías/proteína y fatiga acumulada.")
@@ -2000,6 +2098,16 @@ def view_exercise(day, sid, d_str, sets_df, ex, auto_rest):
           + kpi("vs última sesión", vs) + kpi("Próxima serie", f"#{next_set}" if next_set and not complete else "—",
                                               f" · RIR objetivo {ex['rir']}") + "</div>")
 
+    if not activity and completed:
+        cur_s = session_from_sets(completed)
+        chk_now = overload_check(cur_s, ex["rmin"], ex["rmax"], ex["sets"], ex["rir"])
+        if complete or chk_now["ready"]:
+            H(overload_card(chk_now, "Evaluación de hoy", inc, u,
+                            "Con lo que registraste hoy, para la próxima sesión"))
+        else:
+            H(f'<div class="gx-muted" style="margin:6px 0 4px">Hacia subir carga: {chk_now["at_top"]} de {ex["sets"]} '
+              f'series en el tope de {ex["rmax"]} reps con RIR ≥ {ex["rir"]}.</div>')
+
     if complete:
         names = [e["name"] for e in day["exercises"]]
         i = names.index(name)
@@ -2077,6 +2185,30 @@ def view_session_done(sid, sess, d, u):
       f'<div class="gx-kpis" style="margin-top:8px">{kpi("Duración", hms(dur))}{kpi("Ejercicios", S["exercises"])}'
       f'{kpi("Series completadas", S["sets"])}{kpi("Repeticiones", S["reps"])}'
       f'{kpi(f"Volumen ({u}·rep)", fmt_n(S["volume"]))}</div>{diff}<div style="margin-top:8px">{prs}</div></div>')
+    day = DAYS.get(sess.get("day_name") or "")
+    if day:
+        df_all = all_sets_df(ver())
+        cur = df_all[df_all["session_id"] == sid]
+        up, keep = [], []
+        for e in day["exercises"]:
+            if e["kind"] == "activity":
+                continue
+            ss_ = summarize_sessions(cur[cur["exercise"] == e["name"]], u)
+            if not ss_:
+                continue
+            chk = overload_check(ss_[-1], e["rmin"], e["rmax"], e["sets"], e["rir"])
+            if chk["ready"]:
+                up.append(f'<div class="gx-text">⬆ <b>{esc(e["name"])}</b>: {fmt_w(chk["weight"])} → '
+                          f'<b>{fmt_w(chk["weight"] + inc_for(e, u))} {u}</b></div>')
+            else:
+                keep.append(f'<div class="gx-muted" style="margin-top:4px">= {esc(e["name"])}: mantén {fmt_w(chk["weight"])} {u} '
+                            f'({min(chk["at_top"], e["sets"])} de {e["sets"]} series en el tope)</div>')
+        if up or keep:
+            up_html = "".join(up) or '<div class="gx-muted">Ningún ejercicio cumple aún para subir.</div>'
+            H(f'<div class="gx-card"><div class="gx-title">Sobrecarga progresiva: próxima sesión</div>'
+              f'{up_html}'
+              f'{"".join(keep)}<div class="gx-muted" style="margin-top:8px">La subida se confirma en la próxima '
+              f'sesión; la app nunca cambia la carga sola.</div></div>')
     st.button("Reabrir sesión", key="reopen", on_click=cb_reopen_session, args=(sid,), **btn_w())
 
 
@@ -2088,7 +2220,10 @@ def view_workout():
     if st.session_state["day_pick"] not in DAYS:
         st.session_state["day_pick"] = suggested_day()
     day_key = st.selectbox("Sesión", DAY_KEYS, key="day_pick",
+                           format_func=lambda k: f"{k} · {weekday_name_for(k)}",
                            on_change=keep_state, args=("day_pick", "_keep_day"))
+    if day_key != suggested_day():
+        st.caption(f"Hoy ({DIAS_ES[d.weekday()]}) toca {suggested_day()}. Estás registrando otra sesión con fecha de hoy.")
     day = DAYS[day_key]
     sid, d_str = f"{d}|{day['slug']}", str(d)
     if not day["exercises"]:
@@ -2096,11 +2231,23 @@ def view_workout():
         return
     sess = get_session(sid)
     if not sess:
+        def up_tag(e):
+            if e["kind"] == "activity":
+                return ""
+            ss_ = summarize_sessions(exercise_history(e["name"], sid, hver()), u)
+            if not ss_:
+                return ""
+            chk = overload_check(ss_[-1], e["rmin"], e["rmax"], e["sets"], e["rir"])
+            if not chk["ready"]:
+                return ""
+            return (f'<div style="font-size:11px;color:{C_GREEN}">⬆ Toca subir: '
+                    f'{fmt_w(chk["weight"])} → {fmt_w(chk["weight"] + inc_for(e, u))} {u}</div>')
         rows = "".join(
-            f'<div class="gx-row" style="padding:6px 0;border-bottom:1px solid {C_BORDER}"><span style="font-size:13px">{esc(e["name"])}</span>'
-            f'<span class="gx-muted">{esc(presc_text(e))}</span></div>'
+            f'<div class="gx-row" style="padding:6px 0;border-bottom:1px solid {C_BORDER}"><div><span style="font-size:13px">{esc(e["name"])}</span>'
+            f'{up_tag(e)}</div><span class="gx-muted" style="white-space:nowrap">{esc(presc_text(e))}</span></div>'
             for e in day["exercises"])
-        H(f'<div class="gx-card"><div class="gx-title">{esc(day_key)}</div><div class="gx-muted">{len(day["exercises"])} ejercicios</div>{rows}</div>')
+        H(f'<div class="gx-card"><div class="gx-title">{esc(day_key)}</div><div class="gx-muted">{len(day["exercises"])} ejercicios · '
+          f'{esc(weekday_name_for(day_key))}</div>{rows}</div>')
         st.button("Comenzar entrenamiento", type="primary", key="start_session", on_click=cb_start_training,
                   args=(day_key, False), **btn_w())
         return
@@ -2234,7 +2381,7 @@ def view_compare(df_all, u):
           f' (pendiente de tu confirmación)</div><div class="gx-text">{esc(r["reason"])}</div></div>')
 
 
-def build_weeks(df_all, sess, meals, body, daily, rec, closed, start, u):
+def build_weeks(df_all, sess, meals, body, rec, closed, start, u):
     weeks = []
     today_ = pd.Timestamp(today())
 
@@ -2292,7 +2439,7 @@ def build_weeks(df_all, sess, meals, body, daily, rec, closed, start, u):
 def view_block(df_all, u):
     start = program_start()
     weeks = build_weeks(df_all, sessions_df(ver()), meals_daily_df(ver()), body_df(ver()),
-                        recovery_df(ver()), recovery_df(ver()), closed_weeks(ver()), start, u)
+                        recovery_df(ver()), closed_weeks(ver()), start, u)
     cur_wk = week_number(today())
     cards = []
     for w in weeks:
@@ -2300,9 +2447,11 @@ def view_block(df_all, u):
         grp = ", ".join(f"{k} {v}" for k, v in list(w["by_group"].items())[:4]) or "—"
         lifts = ", ".join(f"{k.split(' ')[0]} {fmt_w(v)}" for k, v in sorted(w["top"].items(), key=lambda kv: -kv[1])[:2]) or "—"
         notes = ("; ".join(w["notes"])[:80]) if w["notes"] else "—"
+        w_end = w["start"] + timedelta(days=6)
         cards.append(
             f'<div class="gx-week"><div class="gx-row"><b>Semana {w["n"]}</b>{badge(w["status"], kind)}</div>'
-            f'<div class="gx-muted">{esc(fecha_corta(w["start"]))}{" · actual" if w["n"] == cur_wk else ""}</div>'
+            f'<div class="gx-muted">sáb {esc(fecha_corta(w["start"]))} – vie {esc(fecha_corta(w_end))}'
+            f'{" · actual" if w["n"] == cur_wk else ""}</div>'
             f'Sesiones <b>{w["finished"]}/{SESSIONS_PER_WEEK}</b> · Adh. <b>{w["adherence"]:.0f}%</b><br>'
             f'Series: <b>{w["sets"]}</b> ({esc(grp)})<br>Cargas: {esc(lifts)} {u}<br>'
             f'Peso: <b>{fmt_n(w["bw"], 1) if w["bw"] else "—"}</b> kg · Cintura: <b>{fmt_n(w["waist"], 1) if w["waist"] else "—"}</b> cm<br>'
@@ -2461,10 +2610,11 @@ def view_nutrition():
     style_time_axis(fig, m["date"])
     show_chart(fig, "nu_prot")
     wk = md.copy()
-    wk["sem"] = wk["date"].map(lambda t: pd.Timestamp(week_start_of(t.date())))
+    # Semanas de sábado a viernes (W-FRI = la semana termina en viernes)
+    wk["sem"] = wk["date"].dt.to_period("W-FRI").apply(lambda p: p.start_time)
     agg = wk.groupby("sem").agg(Kcal=("cal", "mean"), Proteina=("prot", "mean"), Carbs=("carbs", "mean"), Grasas=("fat", "mean"),
                                 Dias=("cal", "size")).reset_index().sort_values("sem", ascending=False).head(8)
-    agg["Semana"] = agg["sem"].map(lambda t: fecha_corta(t.date()))
+    agg["Semana"] = agg["sem"].map(lambda t: "sáb " + fecha_corta(t.date()))
     st.dataframe(agg[["Semana", "Dias", "Kcal", "Proteina", "Carbs", "Grasas"]].round(0), hide_index=True, **df_w())
 
 
@@ -2543,11 +2693,16 @@ def view_plan():
 
     H('<div class="gx-title" style="margin:14px 0 6px">Bloque de entrenamiento</div>')
     start = program_start()
-    st.date_input("Inicio del bloque (sábado de Día 1 UPPER; se ajusta al sábado anterior o igual)", start, key="pl_start")
+    st.date_input("Inicio del bloque (se ajusta al sábado de esa semana)", start, key="pl_start")
     st.button("Guardar inicio del bloque", key="pl_start_btn", on_click=cb_save_program, **btn_w())
     wk = week_number(d)
-    st.caption(f"Hoy es la semana {wk} de {WEEKS}." if 1 <= wk <= WEEKS else
+    st.caption(f"Hoy es la semana {wk} de {WEEKS} (semanas de sábado a viernes)." if 1 <= wk <= WEEKS else
                "El bloque aún no inicia." if wk < 1 else "El bloque de 8 semanas ya terminó.")
+    sched = "".join(
+        f'<div class="gx-row" style="padding:5px 0;border-bottom:1px solid {C_BORDER}">'
+        f'<span style="font-size:13px">{esc(weekday_name_for(k).capitalize())}</span>'
+        f'<span class="gx-muted">{esc(k)}</span></div>' for k in DAY_KEYS)
+    H(f'<div class="gx-card" style="margin-top:8px"><div class="gx-title">Calendario semanal</div>{sched}</div>')
 
     H('<div class="gx-title" style="margin:14px 0 6px">Preferencias</div>')
     init_state("pl_unit", u)
@@ -2558,13 +2713,6 @@ def view_plan():
     mode = db().mode
     st.caption("Almacenamiento: Turso (persistente)." if mode == "turso" else
                "⚠ Almacenamiento local temporal: configura TURSO_DATABASE_URL y TURSO_AUTH_TOKEN para no perder datos.")
-    found, nested = secrets_status()
-    mark = lambda ok: "✓ detectado" if ok else "✗ no detectado"
-    st.caption(f"Secrets · TURSO_DATABASE_URL: {mark(found['TURSO_DATABASE_URL'])} · "
-               f"TURSO_AUTH_TOKEN: {mark(found['TURSO_AUTH_TOKEN'])} · GEMINI_API_KEY: {mark(found['GEMINI_API_KEY'])}")
-    if nested:
-        st.warning("Tus secrets están dentro de una sección ([" + ", ".join(nested) + "]). Muévelos arriba de cualquier "
-                   "encabezado [..] en el archivo de secrets, sin sección.")
 
 
 # =============================================================================
@@ -2577,8 +2725,6 @@ def main():
         db()
     except Exception as e:
         st.error(f"No se pudo conectar a la base de datos: {e}")
-        st.caption("Revisa TURSO_DATABASE_URL (libsql://…) y TURSO_AUTH_TOKEN en los secrets. "
-                   "Esta versión ya no usa la librería libsql_client.")
         st.stop()
     init_state("nav", NAV[0])
     try:
