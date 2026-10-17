@@ -585,13 +585,18 @@ class Store:
                 pass
 
 
+SCHEMA_VERSION = 3  # súbelo cada vez que se agreguen tablas o columnas
+
+
 @st.cache_resource(show_spinner=False)
-def get_store():
+def get_store(schema_version=SCHEMA_VERSION):
+    # El número de versión forma parte de la caché: al subirlo se crea una conexión
+    # nueva y se vuelven a correr las migraciones (ALTERS) sin reiniciar la app.
     return Store()
 
 
 def db():
-    return get_store()
+    return get_store(SCHEMA_VERSION)
 
 
 def q(sql, params=()):
@@ -1184,10 +1189,10 @@ def session_active_seconds(sess, end=None):
 
 def pending_sessions(v, today_str):
     """Sesiones pospuestas o que quedaron a medias en días anteriores."""
-    rows = q("SELECT s.id, s.date, s.day_name, s.status, s.postponed_to, s.postpone_reason, "
-             "(SELECT COUNT(*) FROM sets_log l WHERE l.session_id=s.id AND l.status IN ('completed','skipped')) "
-             "FROM sessions s WHERE s.user_id=? AND (s.status='postponed' OR (s.status='in_progress' AND s.date<?)) "
-             "ORDER BY s.date DESC LIMIT 6", [UID, today_str])
+    try:
+        rows = _pending_rows(today_str)
+    except Exception:
+        return []
     out = []
     for sid, d_, day_name, status, pto, reason, done in rows:
         day = DAYS.get(day_name)
@@ -1196,6 +1201,13 @@ def pending_sessions(v, today_str):
         out.append(dict(id=sid, date=d_, day_key=day_name, status=status, postponed_to=pto, reason=reason,
                         done=int(done or 0), total=sum(e["sets"] for e in day["exercises"])))
     return out
+
+
+def _pending_rows(today_str):
+    return q("SELECT s.id, s.date, s.day_name, s.status, s.postponed_to, s.postpone_reason, "
+             "(SELECT COUNT(*) FROM sets_log l WHERE l.session_id=s.id AND l.status IN ('completed','skipped')) "
+             "FROM sessions s WHERE s.user_id=? AND (s.status='postponed' OR (s.status='in_progress' AND s.date<?)) "
+             "ORDER BY s.date DESC LIMIT 6", [UID, today_str])
 
 
 def start_session(sid, d, day_key):
@@ -3021,29 +3033,93 @@ def view_nutrition():
     st.dataframe(agg[["Semana", "Dias", "Kcal", "Proteina", "Carbs", "Grasas"]].round(0), hide_index=True, **df_w())
 
 
-def view_export():
-    if not st.toggle("Preparar archivos de exportación", key="prep_export"):
-        st.caption("Activa el interruptor para generar los archivos.")
-        return
-    tables = {"series": "SELECT * FROM sets_log ORDER BY date, session_id, exercise, set_no",
-              "sesiones": "SELECT * FROM sessions ORDER BY date",
-              "comidas": "SELECT * FROM meals ORDER BY date, id",
-              "metas_y_sueno": "SELECT * FROM daily_metrics ORDER BY date",
-              "recuperacion": "SELECT * FROM recovery_log ORDER BY date",
-              "medidas_corporales": "SELECT * FROM body_metrics ORDER BY date",
-              "progresion": "SELECT * FROM progression_log ORDER BY id",
-              "entrenamientos_antiguos": "SELECT * FROM workouts ORDER BY date, id"}
-    bundle = {}
-    for name, sql in tables.items():
-        try:
-            df = qdf(sql)
-        except Exception:
+BACKUP_TABLES = {  # nombre en el respaldo -> (tabla, orden)
+    "series": ("sets_log", "date, session_id, exercise, set_no"),
+    "sesiones": ("sessions", "date"),
+    "comidas": ("meals", "date, id"),
+    "metas_y_sueno": ("daily_metrics", "date"),
+    "recuperacion": ("recovery_log", "date"),
+    "medidas_corporales": ("body_metrics", "date"),
+    "progresion": ("progression_log", "id"),
+    "entrenamientos_antiguos": ("workouts", "date, id"),
+    "ajustes": ("settings", "key"),
+    "cargas_confirmadas": ("load_targets", "exercise"),
+    "config_ejercicios": ("exercise_config", "exercise"),
+    "programa": ("programs", "id"),
+    "semanas_bloque": ("program_weeks", "week_no"),
+}
+
+
+def table_columns(table):
+    return [r[1] for r in q(f"PRAGMA table_info({table})")]
+
+
+def restore_backup(bundle):
+    """Inserta (o reemplaza) las filas de un respaldo JSON. Devuelve {tabla: filas}."""
+    done = {}
+    for name, (table, _) in BACKUP_TABLES.items():
+        rows = bundle.get(name) or []
+        if not rows:
             continue
-        bundle[name] = json.loads(df.to_json(orient="records", force_ascii=False))
-        st.download_button(f"{name}.csv · {len(df)} filas", df.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"gains_{name}.csv", mime="text/csv", key=f"dl_{name}", **dl_w("download"))
-    st.download_button("Todo en JSON", json.dumps(bundle, ensure_ascii=False, indent=1).encode("utf-8"),
-                       file_name=f"gains_backup_{today()}.json", mime="application/json", key="dl_json", **dl_w("download"))
+        cols = set(table_columns(table))
+        n = 0
+        for r in rows:
+            keys = [k for k in r if k in cols]
+            if not keys:
+                continue
+            vals = [r[k] for k in keys]
+            x(f"INSERT OR REPLACE INTO {table} ({', '.join(keys)}) VALUES ({', '.join('?' for _ in keys)})", vals)
+            n += 1
+        done[name] = n
+    for k in ("_settings", "_pstart", "_excfg", "_targets"):
+        st.session_state.pop(k, None)
+    bump(True)
+    return done
+
+
+def view_export():
+    mode = db().mode
+    if mode != "turso":
+        st.warning("Tus datos se guardan en un archivo temporal del servidor. Streamlit Cloud lo borra cuando la app "
+                   "se reinicia o se duerme por inactividad. Descarga un respaldo y configura Turso para que sean permanentes.")
+    H('<div class="gx-sec" style="margin-top:6px">Respaldo</div>')
+    if st.toggle("Preparar archivos de exportación", key="prep_export"):
+        bundle = {}
+        for name, (table, order) in BACKUP_TABLES.items():
+            try:
+                df = qdf(f"SELECT * FROM {table} ORDER BY {order}")
+            except Exception:
+                continue
+            bundle[name] = json.loads(df.to_json(orient="records", force_ascii=False))
+            if name in ("series", "sesiones", "comidas", "medidas_corporales"):
+                st.download_button(f"{name}.csv · {len(df)} filas", df.to_csv(index=False).encode("utf-8-sig"),
+                                   file_name=f"gains_{name}.csv", mime="text/csv", key=f"dl_{name}", **dl_w("download"))
+        st.download_button("Respaldo completo (JSON)", json.dumps(bundle, ensure_ascii=False, indent=1).encode("utf-8"),
+                           file_name=f"gains_backup_{today()}.json", mime="application/json", key="dl_json",
+                           type="primary", **dl_w("download"))
+        st.caption("El JSON incluye todo: series, sesiones, comidas, metas, medidas, ajustes y cargas confirmadas.")
+    else:
+        st.caption("Activa el interruptor para generar los archivos.")
+
+    H('<div class="gx-sec">Restaurar respaldo</div>')
+    st.caption("Sube un archivo gains_backup_….json para recuperar tus datos. Los registros con el mismo "
+               "identificador se reemplazan; no se duplican.")
+    up = st.file_uploader("Archivo de respaldo", type=["json"], key="restore_file", label_visibility="collapsed")
+    if up is not None:
+        try:
+            bundle = json.loads(up.getvalue().decode("utf-8"))
+            counts = {k: len(v or []) for k, v in bundle.items() if k in BACKUP_TABLES}
+        except Exception:
+            st.error("El archivo no es un respaldo válido de Gains OS.")
+            return
+        st.caption("Contenido: " + ", ".join(f"{k} {v}" for k, v in counts.items() if v) if any(counts.values())
+                   else "El respaldo está vacío.")
+        if any(counts.values()) and st.button("Restaurar datos", type="primary", key="restore_btn", **btn_w("restore")):
+            try:
+                res = restore_backup(bundle)
+                st.success("Datos restaurados: " + ", ".join(f"{k} {v}" for k, v in res.items()))
+            except Exception as e:
+                st.error(f"No se pudo restaurar: {e}")
 
 
 def view_progress():
