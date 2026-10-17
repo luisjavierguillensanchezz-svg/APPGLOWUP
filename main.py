@@ -53,10 +53,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from pydantic import BaseModel
 
-try:  # modo local si no está instalado
-    import libsql_client
-except ImportError:  # pragma: no cover
-    libsql_client = None
+import base64
 try:
     from google import genai
 except ImportError:  # pragma: no cover
@@ -484,18 +481,53 @@ class Result:
         self.rows, self.cols, self.lastrowid = rows, cols, lastrowid
 
 
+def _hrana_arg(v):
+    """Valor Python -> argumento de la API HTTP de Turso (Hrana)."""
+    if v is None:
+        return {"type": "null"}
+    if isinstance(v, bool):
+        v = int(v)
+    if isinstance(v, int):
+        return {"type": "integer", "value": str(v)}
+    if isinstance(v, float):
+        if math.isnan(v) or math.isinf(v):
+            return {"type": "null"}
+        return {"type": "float", "value": v}
+    if isinstance(v, (bytes, bytearray)):
+        return {"type": "blob", "base64": base64.b64encode(bytes(v)).decode()}
+    return {"type": "text", "value": str(v)}
+
+
+def _hrana_val(c):
+    t = c.get("type")
+    if t == "null":
+        return None
+    if t == "integer":
+        return int(c["value"])
+    if t == "float":
+        return float(c["value"])
+    if t == "blob":
+        return base64.b64decode(c.get("base64") or "")
+    return c.get("value")
+
+
 class Store:
+    """Base de datos: Turso por HTTP (persistente) o SQLite local (temporal)."""
+
     def __init__(self):
         self.lock = threading.RLock()
-        self._client = None
-        url, token = secret("TURSO_DATABASE_URL"), secret("TURSO_AUTH_TOKEN")
-        if url and token and libsql_client is not None:
+        url, token = (secret("TURSO_DATABASE_URL") or "").strip(), (secret("TURSO_AUTH_TOKEN") or "").strip()
+        missing = [n for n, v in (("TURSO_DATABASE_URL", url), ("TURSO_AUTH_TOKEN", token)) if not v]
+        if not missing:
             self.mode = "turso"
-            # Limpiamos slashes extra que causan el error
-            self.url = url.replace("libsql://", "https://").rstrip("/")
+            self.url = re.sub(r"^(libsql|wss?)://", "https://", url).rstrip("/")
             self.token = token
+            self.http = requests.Session()
+            self.http.headers.update({"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+            self.reason = ""
         else:
             self.mode = "local"
+            self.reason = "Faltan los secrets: " + " y ".join(missing) + "."
             self.conn = sqlite3.connect(secret("GAINS_DB_PATH", "gains_local.db"), check_same_thread=False)
         self.init_schema()
 
@@ -512,18 +544,37 @@ class Store:
             return p.isoformat()
         return p
 
-    def _get_client(self):
-        if self._client is None:
-            self._client = libsql_client.create_client_sync(url=self.url, auth_token=self.token)
-        return self._client
-
-    def _reset(self):
-        try:
-            if self._client is not None:
-                self._client.close()
-        except Exception:
-            pass
-        self._client = None
+    def _turso(self, sql, params):
+        body = {"requests": [{"type": "execute", "stmt": {"sql": sql, "args": [_hrana_arg(v) for v in params]}},
+                             {"type": "close"}]}
+        last = None
+        for attempt in range(3):
+            try:
+                resp = self.http.post(self.url + "/v2/pipeline", json=body, timeout=20)
+            except requests.RequestException as e:  # red: reintento corto
+                last = e
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            if resp.status_code in (401, 403):
+                raise RuntimeError("Turso rechazó el token (HTTP %s). Genera un token nuevo y actualiza "
+                                   "TURSO_AUTH_TOKEN en los secrets." % resp.status_code)
+            if resp.status_code == 404:
+                raise RuntimeError("Turso no encontró la base de datos (HTTP 404). Revisa TURSO_DATABASE_URL.")
+            if resp.status_code >= 500:
+                last = RuntimeError(f"Turso HTTP {resp.status_code}: {resp.text[:200]}")
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            if resp.status_code != 200:
+                raise RuntimeError(f"Turso HTTP {resp.status_code}: {resp.text[:300]}")
+            res = resp.json()["results"][0]
+            if res.get("type") == "error":
+                raise RuntimeError("Turso: " + str((res.get("error") or {}).get("message", res)))
+            r = res["response"]["result"]
+            cols = [c.get("name") for c in r.get("cols", [])]
+            rows = [tuple(_hrana_val(c) for c in row) for row in r.get("rows", [])]
+            lid = r.get("last_insert_rowid")
+            return Result(rows, cols, int(lid) if lid not in (None, "") else None)
+        raise RuntimeError(f"No se pudo conectar con Turso: {last}")
 
     def execute(self, sql, params=()):
         params = [self._clean(p) for p in params]
@@ -534,32 +585,7 @@ class Store:
                 cols = [d[0] for d in cur.description] if cur.description else []
                 self.conn.commit()
                 return Result(rows, cols, cur.lastrowid)
-
-            last = None
-            for _ in range(2):
-                try:
-                    rs = self._get_client().execute(sql, params)
-                    return Result([tuple(r) for r in rs.rows], list(rs.columns),
-                                  getattr(rs, "last_insert_rowid", None))
-                except KeyError as e:
-                    # INTERCEPTOR DE ERRORES: Si la librería falla con 'result', le preguntamos a Turso directamente el motivo
-                    if "result" in str(e):
-                        try:
-                            u = self.url + "/v2/pipeline"
-                            h = {"Authorization": f"Bearer {self.token}"}
-                            b = {"requests": [{"type": "execute", "stmt": {"sql": "SELECT 1", "args": []}}]}
-                            resp = requests.post(u, json=b, headers=h)
-                            raise RuntimeError(f"Rechazo de Turso. Respuesta exacta del servidor: {resp.text}")
-                        except Exception as req_e:
-                            if "Respuesta exacta" in str(req_e):
-                                raise req_e
-                            raise RuntimeError(f"Turso rechazó la conexión y falló la lectura del error: {req_e}")
-                    last = e
-                    self._reset()
-                except Exception as e:
-                    last = e
-                    self._reset()
-            raise last
+            return self._turso(sql, params)
 
     def init_schema(self):
         for s in SCHEMA:
@@ -585,7 +611,7 @@ class Store:
                 pass
 
 
-SCHEMA_VERSION = 3  # súbelo cada vez que se agreguen tablas o columnas
+SCHEMA_VERSION = 4  # súbelo cada vez que se agreguen tablas o columnas
 
 
 @st.cache_resource(show_spinner=False)
@@ -3188,9 +3214,12 @@ def view_plan():
     init_state("pl_name", settings().get("name", "Luis"))
     st.text_input("Tu nombre", key="pl_name", on_change=cb_pref, args=("name", "pl_name"))
     st.caption("Al cambiar de unidad, los registros guardados se convierten para mostrarse; los incrementos mínimos por ejercicio vuelven a sus valores por defecto.")
-    mode = db().mode
-    st.caption("Almacenamiento: Turso (persistente)." if mode == "turso" else
-               "Almacenamiento local temporal: configura TURSO_DATABASE_URL y TURSO_AUTH_TOKEN para no perder datos.")
+    store = db()
+    if store.mode == "turso":
+        st.caption("Almacenamiento: Turso (persistente).")
+    else:
+        st.warning(f"Almacenamiento temporal: tus datos se borran cuando la app se reinicia. {store.reason} "
+                   "Agrégalos en Manage app › Settings › Secrets.")
 
 
 # =============================================================================
