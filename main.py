@@ -38,6 +38,7 @@ import inspect
 import json
 import math
 import os
+import random
 import re
 import sqlite3
 import threading
@@ -166,6 +167,91 @@ EX_GROUP = {}
 for _d in DAYS.values():
     for _e in _d["exercises"]:
         EX_GROUP.setdefault(_e["name"], _e["group"])
+
+# Frases de motivación por momento. Se elige una por día (no cambia en cada recarga).
+MOTIVATION = {
+    "training": [
+        "Hoy no tiene que ser perfecto. Tiene que estar hecho.",
+        "Cada serie bien hecha es un ladrillo más. Sigue construyendo.",
+        "El músculo no sabe si tenías ganas. Solo sabe si viniste.",
+        "Una repetición más que la semana pasada también es progreso.",
+        "Disciplina es hacerlo igual de bien el día que no te late.",
+        "Tu yo de dentro de ocho semanas te está viendo. Dale una razón para agradecerte.",
+        "Técnica primero, peso después. El orden importa.",
+        "No compitas con nadie más que con tu último registro.",
+        "Lo difícil no es entrenar un día; es volver al siguiente. Y aquí estás.",
+        "Los resultados llegan en silencio, serie tras serie.",
+        "Pequeñas subidas, todas las semanas. Así se ve el progreso real.",
+        "Hoy toca sumar, aunque sea poquito.",
+        "La barra no pesa menos con el tiempo. Tú te haces más fuerte.",
+        "Llegar ya es la mitad. La otra mitad es dar lo mejor en cada serie.",
+        "Confía en el proceso: rango completo, RIR honesto, progreso constante.",
+        "No se trata de motivación, se trata de costumbre. Y ya la estás formando.",
+        "Cada sesión registrada es una prueba de que sí puedes.",
+        "Entrena con intención. Cada repetición cuenta.",
+        "Nadie se arrepiente de un entrenamiento terminado.",
+        "El progreso no grita, se acumula. Hoy acumulas otro poco.",
+        "Respeta el descanso entre series: también es parte del trabajo.",
+        "Fuerte no es el que nunca falla, es el que siempre regresa.",
+    ],
+    "rest": [
+        "Hoy creces. El músculo se construye descansando.",
+        "Descansar no es aflojar; es dejar que el entrenamiento haga efecto.",
+        "Duerme bien, come tu proteína y mañana regresas con todo.",
+        "Un buen descanso hoy es un mejor entrenamiento mañana.",
+        "La recuperación también está en el plan. Cúmplela igual de bien.",
+        "Hoy el trabajo está en la cocina y en la almohada.",
+        "Las piernas, la espalda y la cabeza también necesitan su día libre.",
+    ],
+    "finished": [
+        "Sesión terminada. Eso ya nadie te lo quita.",
+        "Otro entrenamiento al banco. Así se construyen los resultados.",
+        "Hoy cumpliste. Ahora a comer bien y descansar.",
+        "Una sesión más cerca de la meta. Buen trabajo.",
+        "Lo hiciste aunque costara. Eso es lo que marca la diferencia.",
+        "Registrado y completado. Tu yo del futuro te lo agradece.",
+    ],
+    "pr": [
+        "Nuevo récord. El trabajo de las semanas pasadas se está notando.",
+        "Récord personal. Esto es progreso en números.",
+        "Hoy fuiste más fuerte que nunca. Anótalo y sigue.",
+    ],
+    "postponed": [
+        "Escuchar a tu cuerpo también es entrenar con inteligencia.",
+        "Un día en pausa no borra todo lo que has avanzado.",
+        "Lo que hiciste hoy cuenta. Recupérate y lo terminas después.",
+        "Parar a tiempo es mejor que forzar una lesión.",
+        "Descansa sin culpa. La constancia se mide en semanas, no en un día.",
+    ],
+    "level_up": [
+        "Te ganaste subir la carga. Hazlo con la misma técnica.",
+        "Cumpliste todo el rango: toca más peso. Así se progresa.",
+        "El peso de hoy ya te quedó chico. Siguiente nivel.",
+    ],
+    "exercise_done": [
+        "Uno menos. A por el siguiente.",
+        "Ejercicio completado. Mantén el ritmo.",
+        "Bien hecho. Respira y sigue.",
+        "Listo. Cada ejercicio terminado suma.",
+    ],
+}
+
+
+def quotes_on():
+    return settings().get("quotes", "1") == "1"
+
+
+def motivation(ctx, salt=""):
+    """Frase para el momento 'ctx'. Estable durante el día (misma frase al recargar)."""
+    opts = MOTIVATION.get(ctx) or MOTIVATION["training"]
+    return random.Random(f"{ctx}|{today().isoformat()}|{salt}").choice(opts)
+
+
+def quote_html(ctx, salt="", style=""):
+    if not quotes_on():
+        return ""
+    return f'<div class="gx-quote" style="{style}">{esc(motivation(ctx, salt))}</div>'
+
 
 TIPS = {
     "Press inclinado con mancuernas": "Banco a 30°. Baja controlado hasta estirar el pecho y empuja sin chocar las mancuernas arriba.",
@@ -1308,7 +1394,8 @@ def cb_postpone_session(sid):
     S["nav"] = NAV[0]
     bump(True)
     flash("success", f"Entrenamiento pospuesto para el {fecha_es(to).lower()}. "
-                     f"Tus {done[0] if done else 0} series ya hechas quedaron guardadas.")
+                     f"Tus {done[0] if done else 0} series ya hechas quedaron guardadas."
+                     + (f" {motivation('postponed', sid)}" if quotes_on() else ""))
 
 
 def cb_resume_session(sid):
@@ -1850,6 +1937,10 @@ div[role="radiogroup"] label:focus-within {{outline:2px solid rgba(255,90,95,.5)
 .gx-list-row:last-child {{border-bottom:none;}}
 .gx-list-row .n {{font-family:var(--disp); font-size:18px; font-weight:700; color:var(--muted); width:20px; flex:none;}}
 
+/* Frase de motivación */
+.gx-quote {{font-size:15px; font-weight:600; color:#E6E9F0; line-height:1.45; margin-top:12px; max-width:44ch;}}
+.gx-quote.sm {{font-size:13.5px; color:#D5DAE6; margin-top:8px;}}
+
 /* Evaluación de sobrecarga progresiva */
 .gx-check {{display:flex; align-items:center; gap:7px; font-size:12.5px; color:var(--muted); margin-top:6px;}}
 .gx-check.ok {{color:var(--green);}}
@@ -1907,7 +1998,8 @@ def overload_card(chk, title, inc, u, subtitle=""):
                     for t, ok in chk["checks"])
     if chk["ready"]:
         verdict = badge("Sí, toca subir", "ok")
-        foot = (f'<div class="gx-text"><b>Próxima carga: {fmt_w(chk["weight"] + inc)} {u}</b> '
+        foot = (quote_html("level_up", f"{title}{chk['weight']}").replace('class="gx-quote"', 'class="gx-quote sm"') +
+                f'<div class="gx-text"><b>Próxima carga: {fmt_w(chk["weight"] + inc)} {u}</b> '
                 f'(+{fmt_w(inc)}) si la técnica fue buena.</div>')
     else:
         verdict = badge("Todavía no", "pend")
@@ -2102,6 +2194,8 @@ def view_home():
     finished_dates = {str(r[0]) for r in wk_rows if r[1] == "finished"}
     postponed_dates = {str(r[0]) for r in wk_rows if r[1] in ("postponed", "in_progress") and str(r[0]) < str(d)}
     big = f'<div class="gx-hero-num">{wk:02d}</div>' if 1 <= wk <= WEEKS else ""
+    home_ctx = ("rest" if rest_day else {"finished": "finished", "postponed": "postponed"}.get(
+        D.get("today_status"), "training"))
     segs = week_segments(wk if 1 <= wk <= WEEKS else (WEEKS + 1 if wk > WEEKS else 0))
     today_txt = ("Descanso total. Recuperar también es entrenar." if rest_day
                  else f'{len(day["exercises"])} ejercicios · {sum(e["sets"] for e in day["exercises"])} series')
@@ -2112,7 +2206,8 @@ def view_home():
       f'{week_strip(d, finished_dates, postponed_dates)}'
       f'<div class="gx-today"><div class="gx-muted">Hoy toca</div>'
       f'<div class="gx-title lg">{esc(day_key)}</div>'
-      f'<div class="gx-muted">{esc(today_txt)}</div></div></div>')
+      f'<div class="gx-muted">{esc(today_txt)}</div></div>'
+      f'{quote_html(home_ctx, style="margin-top:14px")}</div>')
     if not rest_day:
         label = {None: "Comenzar entrenamiento", "in_progress": "Continuar entrenamiento",
                  "finished": "Ver resumen de hoy", "postponed": "Retomar entrenamiento"}.get(
@@ -2493,7 +2588,8 @@ def view_exercise(day, sid, d_str, sets_df, ex, auto_rest):
         i = names.index(name)
         H(f'<div class="gx-card good" style="margin-top:10px"><div class="gx-title gx-up">{ico("check", size=18)} Ejercicio completado</div>'
           f'<div class="gx-text">{len(completed)} series · {reps_t} repeticiones · {fmt_n(vol)} {u}·rep'
-          f'{" · " + vs + " vs la última sesión" if vs != "—" else ""}</div></div>')
+          f'{" · " + vs + " vs la última sesión" if vs != "—" else ""}</div>'
+          f'{quote_html("exercise_done", name, "")}</div>')
         if i + 1 < len(names):
             rests = {e["name"]: rest_for(e) for e in day["exercises"]}
             st.button("Siguiente ejercicio", type="primary", key=f"next_{es}", on_click=cb_set_exercise,
@@ -2561,6 +2657,7 @@ def view_session_done(sid, sess, d, u):
         diff = (f'<div class="gx-text">vs sesión del {esc(fecha_corta(S["prev"]["date"]))}: '
                 f'{sign(S["sets"] - S["prev"]["sets"])} series · {sign(dv, 0)} {u}·rep{pct}</div>')
     H(f'<div class="gx-card good"><div class="gx-title lg">Sesión finalizada</div>'
+      f'{quote_html("pr" if S["prs"] else "finished", sid, "margin-top:4px")}'
       f'<div class="gx-kpis" style="margin-top:8px">{kpi("Duración", hms(dur))}{kpi("Ejercicios", S["exercises"])}'
       f'{kpi("Series completadas", S["sets"])}{kpi("Repeticiones", S["reps"])}'
       f'{kpi(f"Volumen ({u}·rep)", fmt_n(S["volume"]))}</div>{diff}<div style="margin-top:8px">{prs}</div></div>')
@@ -3211,6 +3308,9 @@ def view_plan():
     H('<div class="gx-sec">Preferencias</div>')
     init_state("pl_unit", u)
     st.selectbox("Unidad de peso", ["kg", "lb"], key="pl_unit", on_change=cb_unit_change)
+    init_state("pl_quotes", quotes_on())
+    st.toggle("Mostrar frases de motivación", key="pl_quotes",
+              on_change=lambda: set_setting("quotes", "1" if st.session_state.get("pl_quotes") else "0"))
     init_state("pl_name", settings().get("name", "Luis"))
     st.text_input("Tu nombre", key="pl_name", on_change=cb_pref, args=("name", "pl_name"))
     st.caption("Al cambiar de unidad, los registros guardados se convierten para mostrarse; los incrementos mínimos por ejercicio vuelven a sus valores por defecto.")
