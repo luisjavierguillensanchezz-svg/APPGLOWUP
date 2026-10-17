@@ -1,0 +1,13 @@
+# Tema de Gains OS: colócalo en la carpeta .streamlit/ junto a main.py
+[theme]
+base = "dark"
+primaryColor = "#FF5A5F"
+backgroundColor = "#0E1118"
+secondaryBackgroundColor = "#1E2330"
+textColor = "#F5F7FA"
+borderColor = "#2A2F3F"
+baseRadius = "12px"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
