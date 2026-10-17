@@ -81,7 +81,19 @@ MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto
 MESES_AB = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
 DIAS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
 
-NAV = ["🏠 Inicio", "🍽 Comida", "🏋 Rutina", "📈 Progreso", "⚙ Plan"]
+try:
+    _ST_VER = tuple(int(z) for z in re.findall(r"\d+", st.__version__)[:2])
+except Exception:  # pragma: no cover
+    _ST_VER = (0, 0)
+MATERIAL = _ST_VER >= (1, 36)   # iconos Material en botones y etiquetas
+
+
+def _mi(name):
+    return f":material/{name}: " if MATERIAL else ""
+
+
+NAV = [_mi("home") + "Inicio", _mi("restaurant") + "Comida", _mi("fitness_center") + "Rutina",
+       _mi("monitoring") + "Progreso", _mi("tune") + "Plan"]
 RIR_OPTS = [0, 1, 2, 3, 4, 5]
 REST_BY_KIND = {"heavy": 240, "compound": 180, "iso": 90, "activity": 0}
 
@@ -335,8 +347,12 @@ def _w_kwargs(fn):
     return {"width": "stretch"} if "width" in params else {"use_container_width": True}
 
 
-def btn_w():
-    return _w_kwargs(st.button)
+def btn_w(icon=None):
+    """kwargs de ancho completo + icono Material (si la versión de Streamlit lo soporta)."""
+    kw = _w_kwargs(st.button)
+    if icon and MATERIAL:
+        kw["icon"] = f":material/{icon}:"
+    return kw
 
 
 def plot_w():
@@ -351,8 +367,51 @@ def fsb_w():
     return _w_kwargs(st.form_submit_button)
 
 
-def dl_w():
-    return _w_kwargs(st.download_button)
+def dl_w(icon=None):
+    kw = _w_kwargs(st.download_button)
+    if icon and MATERIAL:
+        try:
+            if "icon" in inspect.signature(st.download_button).parameters:
+                kw["icon"] = f":material/{icon}:"
+        except Exception:
+            pass
+    return kw
+
+
+def icon_label(text_if_no_icon):
+    """Etiqueta para botones solo-icono: vacía si hay iconos, texto corto si no."""
+    return "" if MATERIAL else text_if_no_icon
+
+
+_SVG = {
+    "check": '<path d="M20 6 9 17l-5-5"/>',
+    "circle": '<circle cx="12" cy="12" r="7.5"/>',
+    "up": '<path d="M12 19V5M5 12l7-7 7 7"/>',
+    "down": '<path d="M12 5v14M19 12l-7 7-7-7"/>',
+    "flat": '<path d="M5 12h14"/>',
+    "trophy": '<path d="M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0V4zM17 5h3v2a3 3 0 0 1-3 3M7 5H4v2a3 3 0 0 0 3 3"/>',
+}
+
+
+def ico(name, color="currentColor", size=14):
+    return (f'<svg class="gx-ico" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="{color}" '
+            f'stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{_SVG[name]}</svg>')
+
+
+def page_icon():
+    """Icono de pestaña: mancuerna blanca sobre fondo coral (sin emojis)."""
+    try:
+        from PIL import Image, ImageDraw
+        im = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        dr = ImageDraw.Draw(im)
+        dr.rounded_rectangle([0, 0, 63, 63], radius=16, fill=(255, 90, 95, 255))
+        w = (255, 255, 255, 255)
+        dr.rectangle([18, 29, 46, 35], fill=w)
+        for x0 in (10, 46):
+            dr.rounded_rectangle([x0, 20, x0 + 8, 44], radius=3, fill=w)
+        return im
+    except Exception:
+        return None
 
 
 # =============================================================================
@@ -408,7 +467,14 @@ SCHEMA = [
 ALTERS = [  # migraciones aditivas (se ignoran si la columna ya existe)
     "ALTER TABLE daily_metrics ADD COLUMN target_carbs_g REAL",
     "ALTER TABLE daily_metrics ADD COLUMN target_fat_g REAL",
+    # Posponer entrenamientos
+    "ALTER TABLE sessions ADD COLUMN postponed_at TEXT",
+    "ALTER TABLE sessions ADD COLUMN postponed_to TEXT",
+    "ALTER TABLE sessions ADD COLUMN postpone_reason TEXT",
+    "ALTER TABLE sessions ADD COLUMN postpone_count INTEGER DEFAULT 0",
+    "ALTER TABLE sessions ADD COLUMN away_seconds INTEGER DEFAULT 0",
 ]
+POSTPONE_REASONS = ["Me sentí mal", "Dolor o molestia", "Falta de tiempo", "Otro motivo"]
 
 
 class Result:
@@ -483,7 +549,7 @@ class Store:
                             h = {"Authorization": f"Bearer {self.token}"}
                             b = {"requests": [{"type": "execute", "stmt": {"sql": "SELECT 1", "args": []}}]}
                             resp = requests.post(u, json=b, headers=h)
-                            raise RuntimeError(f"🚨 Rechazo de Turso. Respuesta exacta del servidor: {resp.text}")
+                            raise RuntimeError(f"Rechazo de Turso. Respuesta exacta del servidor: {resp.text}")
                         except Exception as req_e:
                             if "Respuesta exacta" in str(req_e):
                                 raise req_e
@@ -1093,9 +1159,43 @@ def home_data(v, today_str, start_str, day_slug):
 # =============================================================================
 # 8. SESIONES Y SERIES (escritura)
 # =============================================================================
+_SESS_COLS = ["id", "date", "day_key", "day_name", "started_at", "finished_at", "status",
+              "postponed_at", "postponed_to", "postpone_reason", "postpone_count", "away_seconds"]
+
+
 def get_session(sid):
-    r = q1("SELECT id, date, day_key, day_name, started_at, finished_at, status FROM sessions WHERE id=?", [sid])
-    return dict(zip(["id", "date", "day_key", "day_name", "started_at", "finished_at", "status"], r)) if r else None
+    r = q1("SELECT " + ", ".join(_SESS_COLS) + " FROM sessions WHERE id=?", [sid])
+    if not r:
+        return None
+    d = dict(zip(_SESS_COLS, r))
+    d["away_seconds"] = int(d.get("away_seconds") or 0)
+    d["postpone_count"] = int(d.get("postpone_count") or 0)
+    return d
+
+
+def session_active_seconds(sess, end=None):
+    """Duración real de la sesión: descuenta el tiempo que estuvo pospuesta."""
+    st_ = parse_iso(sess.get("started_at"))
+    if not st_:
+        return 0
+    en = end or parse_iso(sess.get("finished_at")) or now()
+    return max(0.0, (en - st_).total_seconds() - int(sess.get("away_seconds") or 0))
+
+
+def pending_sessions(v, today_str):
+    """Sesiones pospuestas o que quedaron a medias en días anteriores."""
+    rows = q("SELECT s.id, s.date, s.day_name, s.status, s.postponed_to, s.postpone_reason, "
+             "(SELECT COUNT(*) FROM sets_log l WHERE l.session_id=s.id AND l.status IN ('completed','skipped')) "
+             "FROM sessions s WHERE s.user_id=? AND (s.status='postponed' OR (s.status='in_progress' AND s.date<?)) "
+             "ORDER BY s.date DESC LIMIT 6", [UID, today_str])
+    out = []
+    for sid, d_, day_name, status, pto, reason, done in rows:
+        day = DAYS.get(day_name)
+        if not day or not day["exercises"]:
+            continue
+        out.append(dict(id=sid, date=d_, day_key=day_name, status=status, postponed_to=pto, reason=reason,
+                        done=int(done or 0), total=sum(e["sets"] for e in day["exercises"])))
+    return out
 
 
 def start_session(sid, d, day_key):
@@ -1136,6 +1236,7 @@ def keep_state(key, keep_key):
 
 
 def cb_start_training(day_key, go_to_workout=True):
+    st.session_state.pop("active_sid", None)
     d = today()
     sid = f"{d}|{DAYS[day_key]['slug']}"
     start_session(sid, d, day_key)
@@ -1147,12 +1248,75 @@ def cb_start_training(day_key, go_to_workout=True):
 
 def cb_finish_session(sid):
     timer_finalize("manual")
+    st.session_state.pop("active_sid", None)
     x("UPDATE sessions SET status='finished', finished_at=? WHERE id=?", [iso(), sid])
     bump(True)
 
 
+def cb_postpone_session(sid):
+    """Pospone la sesión en curso: guarda lo hecho y deja el resto para otro día."""
+    S = st.session_state
+    reason = S.get("pp_reason") or POSTPONE_REASONS[0]
+    to = S.get("pp_date") or (today() + timedelta(days=1))
+    note = (S.get("pp_note") or "").strip()
+    timer_finalize("manual")
+    text = f"Pospuesta ({reason})" + (f": {note}" if note else "")
+    x("UPDATE sessions SET status='postponed', postponed_at=?, postponed_to=?, postpone_reason=?, "
+      "postpone_count=COALESCE(postpone_count,0)+1, "
+      "notes=CASE WHEN notes IS NULL OR notes='' THEN ? ELSE notes || ' | ' || ? END WHERE id=?",
+      [iso(), str(to), reason, text, text, sid])
+    done = q1("SELECT COUNT(*) FROM sets_log WHERE session_id=? AND status='completed'", [sid])
+    S.pop("active_sid", None)
+    S["nav"] = NAV[0]
+    bump(True)
+    flash("success", f"Entrenamiento pospuesto para el {fecha_es(to).lower()}. "
+                     f"Tus {done[0] if done else 0} series ya hechas quedaron guardadas.")
+
+
+def cb_resume_session(sid):
+    """Retoma una sesión pospuesta (o a medias) justo donde se quedó."""
+    sess = get_session(sid)
+    if not sess:
+        return
+    away = 0
+    if sess["status"] == "postponed" and sess.get("postponed_at"):
+        pa = parse_iso(sess["postponed_at"])
+        away = int(max(0, (now() - pa).total_seconds())) if pa else 0
+    x("UPDATE sessions SET status='in_progress', finished_at=NULL, postponed_to=NULL, "
+      "away_seconds=COALESCE(away_seconds,0)+? WHERE id=?", [away, sid])
+    if sess["date"] == str(today()):
+        st.session_state.pop("active_sid", None)
+        st.session_state["day_pick"] = st.session_state["_keep_day"] = sess["day_name"]
+    else:
+        st.session_state["active_sid"] = sid
+    st.session_state["nav"] = NAV[2]
+    bump(True)
+
+
+def cb_close_pending(sid):
+    """Da por terminada una sesión pendiente con lo que se alcanzó a hacer."""
+    sess = get_session(sid)
+    if not sess:
+        return
+    end = sess.get("postponed_at")
+    if not end:
+        r = q1("SELECT MAX(finished_at) FROM sets_log WHERE session_id=?", [sid])
+        end = r[0] if r and r[0] else iso()
+    x("UPDATE sessions SET status='finished', finished_at=?, postponed_to=NULL WHERE id=?", [end, sid])
+    if st.session_state.get("active_sid") == sid:
+        st.session_state.pop("active_sid", None)
+    bump(True)
+    st.toast("Sesión cerrada con lo que alcanzaste a hacer")
+
+
+def cb_back_today():
+    st.session_state.pop("active_sid", None)
+
+
 def cb_reopen_session(sid):
     x("UPDATE sessions SET status='in_progress', finished_at=NULL WHERE id=?", [sid])
+    if not str(sid).startswith(str(today())):
+        st.session_state["active_sid"] = sid
     bump(True)
 
 
@@ -1472,91 +1636,187 @@ def parse_meal(text):
 # =============================================================================
 CSS = f"""
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=Figtree:wght@400;500;600;700&display=swap');
+:root {{
+  --disp: 'Big Shoulders Display', 'Arial Narrow', 'Roboto Condensed', sans-serif;
+  --body: 'Figtree', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --bg:{C_BG}; --card:{C_CARD}; --card2:{C_CARD2}; --line:{C_BORDER}; --text:{C_TEXT}; --muted:{C_MUTED};
+  --coral:{C_CORAL}; --blue:{C_BLUE}; --orange:{C_ORANGE}; --green:{C_GREEN}; --track:#252A38;
+}}
 #MainMenu, footer, header {{visibility:hidden;}}
-html, body, .stApp, [data-testid="stAppViewContainer"] {{background:{C_BG} !important; color:{C_TEXT};}}
-.block-container {{padding:0.5rem 0.8rem 6rem; max-width:560px;}}
-h1,h2,h3,h4,h5,h6 {{color:{C_TEXT} !important; font-weight:700 !important;}}
+html, body, .stApp, [data-testid="stAppViewContainer"] {{background:var(--bg) !important; color:var(--text);}}
+.stApp, .stApp p, .stApp li, .stApp label, .stApp input, .stApp textarea, .stApp button {{font-family:var(--body);}}
+.block-container {{padding:0.4rem 0.9rem 6rem; max-width:560px;}}
+h1,h2,h3,h4,h5,h6 {{color:var(--text) !important; font-family:var(--disp) !important; font-weight:700 !important; letter-spacing:.01em;}}
 [data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li {{color:#E6E9F0;}}
-[data-testid="stWidgetLabel"] p, label p {{color:#C4CAD8 !important; font-size:12px !important;}}
-[data-testid="stCaptionContainer"] {{color:{C_MUTED} !important;}}
-/* Inputs */
+[data-testid="stWidgetLabel"] p, label p {{color:#C4CAD8 !important; font-size:12.5px !important; font-weight:500;}}
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p {{color:var(--muted) !important; font-size:12px;}}
+::selection {{background:rgba(255,90,95,.35);}}
+
+/* ---------- Campos ---------- */
 div[data-baseweb="input"] > div, div[data-baseweb="base-input"], div[data-baseweb="select"] > div,
 div[data-baseweb="textarea"], div[data-baseweb="textarea"] > div {{
-  background:{C_CARD2} !important; border-color:{C_BORDER} !important; border-radius:10px !important;}}
+  background:var(--card2) !important; border-color:var(--line) !important; border-radius:10px !important;}}
+div[data-baseweb="input"]:focus-within, div[data-baseweb="select"]:focus-within > div,
+div[data-baseweb="textarea"]:focus-within {{border-color:var(--coral) !important;}}
 div[data-baseweb="input"] input, div[data-baseweb="base-input"] input, textarea,
 div[data-baseweb="select"] div {{color:#FFFFFF !important; -webkit-text-fill-color:#FFFFFF;}}
+div[data-baseweb="input"] input {{font-variant-numeric:tabular-nums; font-weight:600;}}
+/* Streamlit reciente (sin baseweb) */
+[data-testid="stSelectbox"] [role="group"], [data-testid="stNumberInputContainer"],
+[data-testid="stTextInputRootElement"], [data-testid="stTextArea"] textarea, [data-testid="stDateInput"] [role="group"] {{
+  background:var(--card2) !important; border-color:var(--line) !important; border-radius:10px !important;}}
+[data-testid="stSelectbox"] [role="group"]:focus-within, [data-testid="stNumberInputContainer"]:focus-within,
+[data-testid="stTextInputRootElement"]:focus-within {{border-color:var(--coral) !important;}}
+[data-testid="stNumberInputField"], [data-testid="stTextInputField"], [data-testid="stSelectbox"] input {{
+  color:#fff !important; -webkit-text-fill-color:#fff; background:transparent !important; font-weight:600;
+  font-variant-numeric:tabular-nums;}}
 button[data-testid="stNumberInputStepUp"], button[data-testid="stNumberInputStepDown"] {{background:transparent !important; color:#C4CAD8 !important;}}
-/* Botones */
+
+/* ---------- Botones ---------- */
 .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {{
-  min-height:44px; border-radius:12px; border:1px solid {C_BORDER}; background:{C_CARD2}; color:{C_TEXT}; font-weight:600;}}
-.stButton > button:hover, .stDownloadButton > button:hover {{border-color:{C_CORAL}; color:#fff;}}
+  min-height:46px; border-radius:12px; border:1px solid var(--line) !important; background:transparent !important; color:var(--text) !important;
+  font-weight:600; font-size:14px; transition:transform .08s ease, border-color .15s ease, background .15s ease;}}
+.stButton > button:hover, .stDownloadButton > button:hover, .stFormSubmitButton > button:hover {{
+  border-color:var(--coral) !important; color:#fff !important; background:rgba(255,90,95,.06) !important;}}
+.stButton > button:active, .stFormSubmitButton > button:active {{transform:scale(.98);}}
+.stButton > button:focus-visible, .stDownloadButton > button:focus-visible {{outline:2px solid var(--coral); outline-offset:2px;}}
 .stButton > button[kind="primary"], .stButton > button[data-testid="stBaseButton-primary"],
 .stFormSubmitButton > button[kind="primary"], .stFormSubmitButton > button[data-testid="stBaseButton-primary"] {{
-  background:{C_CORAL}; border-color:{C_CORAL}; color:#fff;}}
+  background:var(--coral) !important; border-color:var(--coral) !important; color:#fff !important;
+  box-shadow:0 6px 18px -8px rgba(255,90,95,.7);}}
+.stButton > button[kind="primary"]:hover, .stButton > button[data-testid="stBaseButton-primary"]:hover {{background:#FF6B70 !important;}}
+.stButton > button [data-testid="stIconMaterial"] {{font-size:19px;}}
 .stButton > button:disabled {{opacity:.45;}}
-/* Columnas: en móvil NO se apilan (registro de series en una sola fila) */
+
+/* ---------- Columnas: en móvil no se apilan ---------- */
 div[data-testid="stHorizontalBlock"] {{flex-wrap:nowrap !important; gap:0.5rem !important;}}
 div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"],
 div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {{min-width:0 !important;}}
-/* Navegación inferior-estilo app (radio horizontal) */
-.st-key-topnav {{position:sticky; top:0; z-index:100; background:{C_BG}; padding:6px 0 8px;}}
-div[role="radiogroup"] {{display:flex; flex-wrap:nowrap; gap:4px; width:100%; background:{C_CARD};
-  padding:4px; border:1px solid {C_BORDER}; border-radius:14px;}}
-div[role="radiogroup"] > label {{flex:1 1 0; min-width:0; justify-content:center; margin:0; padding:9px 2px;
-  border-radius:10px; cursor:pointer; text-align:center;}}
-div[role="radiogroup"] > label > div:first-child {{display:none;}}
-div[role="radiogroup"] > label p {{font-size:11px !important; margin:0; color:{C_MUTED} !important; white-space:nowrap; letter-spacing:0;}}
-div[role="radiogroup"] > label:has(input:checked) {{background:rgba(255,90,95,.14); box-shadow:inset 0 0 0 1px rgba(255,90,95,.45);}}
-div[role="radiogroup"] > label:has(input:checked) p {{color:{C_CORAL} !important; font-weight:700;}}
-/* Cronómetro fijo arriba mientras se entrena */
-.st-key-timerbox {{position:sticky; top:58px; z-index:90; background:{C_BG}; padding-bottom:4px;}}
-/* Pestañas internas */
-.stTabs [data-baseweb="tab-list"] {{gap:2px; border-bottom:1px solid {C_BORDER};}}
-.stTabs [data-baseweb="tab"] {{padding:8px 8px; font-size:12px; color:{C_MUTED};}}
-.stTabs [aria-selected="true"] {{color:{C_CORAL} !important;}}
-[data-testid="stExpander"] {{border:1px solid {C_BORDER}; border-radius:12px; background:{C_CARD};}}
-/* Tarjetas propias */
-.gx-card {{background:{C_CARD}; border:1px solid {C_BORDER}; border-radius:14px; padding:14px; margin:0 0 10px;}}
-.gx-h1 {{font-size:22px; font-weight:800; color:#fff;}}
-.gx-title {{font-size:15px; font-weight:700; color:#fff;}}
-.gx-muted {{color:{C_MUTED}; font-size:12px;}}
-.gx-text {{color:#D5DAE6; font-size:13px; margin-top:6px;}}
-.gx-row {{display:flex; justify-content:space-between; align-items:center; gap:8px;}}
-.gx-chip {{display:inline-block; padding:3px 9px; border-radius:999px; background:{C_CARD2}; border:1px solid {C_BORDER};
-  color:#C4CAD8; font-size:11px; margin:3px 4px 0 0;}}
-.gx-chip.blue {{border-color:rgba(77,163,255,.5); color:{C_BLUE};}}
-.gx-chip.coral {{border-color:rgba(255,90,95,.5); color:{C_CORAL};}}
-.gx-chip.orange {{border-color:rgba(255,159,67,.5); color:{C_ORANGE};}}
-.gx-badge {{padding:3px 10px; border-radius:999px; font-size:11px; font-weight:700; white-space:nowrap;}}
-.gx-badge.ok {{background:rgba(52,211,153,.15); color:{C_GREEN};}}
-.gx-badge.pend {{background:{C_CARD2}; color:{C_MUTED};}}
-.gx-badge.skip {{background:rgba(255,159,67,.14); color:{C_ORANGE};}}
-.gx-badge.run {{background:rgba(77,163,255,.15); color:{C_BLUE};}}
+
+/* ---------- Navegación ---------- */
+.st-key-topnav {{position:sticky; top:0; z-index:100; background:var(--bg); padding:6px 0 10px;}}
+.st-key-topnav [data-testid="stElementContainer"], .st-key-topnav .element-container,
+.st-key-topnav [data-testid="stRadio"], .st-key-topnav [data-testid="stRadio"] > div,
+.st-key-topnav .stRadio, .st-key-topnav .stRadio > div {{width:100% !important;}}
+div[role="radiogroup"] {{display:flex; flex-wrap:nowrap; gap:2px; width:100%; background:var(--card);
+  padding:4px; border:1px solid var(--line); border-radius:16px;}}
+div[role="radiogroup"] > div, div[role="radiogroup"] > label {{flex:1 1 0; min-width:0; margin:0;}}
+div[role="radiogroup"] label {{width:100%; justify-content:center; margin:0; padding:7px 2px 6px; border-radius:12px;
+  cursor:pointer; text-align:center; transition:background .15s ease;}}
+div[role="radiogroup"] label > div {{justify-content:center; width:100%;}}
+/* oculta el círculo del radio (estructura nueva y antigua de Streamlit) */
+div[role="radiogroup"] label > div > div:first-child:not([data-testid]),
+div[role="radiogroup"] > label > div:first-child:not([data-testid]) {{display:none !important;}}
+div[role="radiogroup"] label p {{display:flex; flex-direction:column; align-items:center; gap:1px;
+  font-size:11px !important; margin:0; color:var(--muted) !important; white-space:nowrap; font-weight:600; line-height:1.2;}}
+div[role="radiogroup"] label p span[role="img"], div[role="radiogroup"] label p [data-testid="stIconMaterial"] {{
+  font-size:21px !important; line-height:1;}}
+div[role="radiogroup"] label:has(input:checked) {{background:rgba(255,90,95,.13);}}
+div[role="radiogroup"] label:has(input:checked) p {{color:var(--coral) !important;}}
+div[role="radiogroup"] label:focus-within {{outline:2px solid rgba(255,90,95,.5); outline-offset:-2px;}}
+
+/* ---------- Cronómetro fijo mientras se entrena ---------- */
+.st-key-timerbox {{position:sticky; top:72px; z-index:90; background:var(--bg); padding-bottom:6px;}}
+
+/* ---------- Pestañas, expanders, contenedores ---------- */
+.stTabs [data-baseweb="tab-list"] {{gap:4px; border-bottom:1px solid var(--line);}}
+.stTabs [data-baseweb="tab"] {{padding:8px 8px; font-size:13px; color:var(--muted); font-weight:600;}}
+.stTabs [aria-selected="true"] {{color:var(--coral) !important;}}
+.stTabs [data-baseweb="tab-highlight"] {{background:var(--coral) !important;}}
+[data-testid="stExpander"] {{border:1px solid var(--line); border-radius:14px; background:var(--card);}}
+[data-testid="stExpander"] summary p {{font-weight:600; font-size:13px;}}
+[data-testid="stVerticalBlockBorderWrapper"]:has(> div > [data-testid="stVerticalBlock"]) {{
+  border-color:var(--line) !important; border-radius:14px !important; background:var(--card);}}
+[data-testid="stAlert"] {{border-radius:12px;}}
+
+/* ---------- Tipografía propia ---------- */
+.gx-h1 {{font-family:var(--disp); font-size:38px; font-weight:800; color:#fff; line-height:1; letter-spacing:.01em;}}
+.gx-title {{font-family:var(--disp); font-size:21px; font-weight:700; color:#fff; line-height:1.15; letter-spacing:.015em;}}
+.gx-title.lg {{font-size:28px;}}
+.gx-sec {{font-family:var(--disp); font-size:22px; font-weight:700; color:#fff; margin:18px 0 8px; letter-spacing:.015em;}}
+.gx-muted {{color:var(--muted); font-size:12.5px; line-height:1.45;}}
+.gx-text {{color:#D5DAE6; font-size:13.5px; margin-top:6px; line-height:1.5;}}
+.gx-num {{font-family:var(--disp); font-variant-numeric:tabular-nums;}}
+.gx-ico {{display:inline-block; vertical-align:-2px; flex:none;}}
+.gx-row {{display:flex; justify-content:space-between; align-items:center; gap:10px;}}
+
+/* ---------- Superficies ---------- */
+.gx-card {{background:var(--card); border:1px solid var(--line); border-radius:16px; padding:16px; margin:0 0 10px;}}
+.gx-card.flat {{background:var(--card2); border-color:transparent;}}
+.gx-card.good {{border-color:rgba(52,211,153,.5);}}
+.gx-ready {{border-color:rgba(52,211,153,.55) !important;}}
+
+/* Portada de Inicio: número de semana como elemento gráfico */
+.gx-hero {{position:relative; overflow:hidden; background:var(--card); border:1px solid var(--line);
+  border-radius:20px; padding:18px 18px 16px; margin:0 0 10px;}}
+.gx-hero > * {{position:relative;}}
+.gx-hero-num {{position:absolute !important; right:-4px; top:-26px; font-family:var(--disp); font-weight:800;
+  font-size:132px; line-height:1; color:transparent; -webkit-text-stroke:1.5px rgba(255,90,95,.30);
+  pointer-events:none; user-select:none; letter-spacing:-.02em;}}
+.gx-segs {{display:grid; grid-template-columns:repeat(8,minmax(0,1fr)); gap:4px; margin-top:8px;}}
+.gx-seg {{height:6px; border-radius:3px; background:var(--track);}}
+.gx-seg.done {{background:var(--blue);}}
+.gx-seg.cur {{background:var(--coral);}}
+.gx-today {{margin-top:16px; padding-top:14px; border-top:1px solid var(--line);}}
+
+/* Tira de la semana (sábado a viernes) */
+.gx-strip {{display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:4px; margin-top:12px;}}
+.gx-day {{background:var(--card2); border-radius:10px; padding:6px 2px 7px; text-align:center; font-size:10.5px;
+  color:var(--muted); border:1px solid transparent; line-height:1.25;}}
+.gx-day b {{display:block; font-family:var(--disp); font-size:20px; font-weight:700; color:#fff; line-height:1.05;}}
+.gx-day small {{display:block; font-size:9.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding:0 2px;}}
+.gx-day.today {{border-color:var(--coral);}}
+.gx-day.today b {{color:var(--coral);}}
+.gx-day.done {{background:rgba(52,211,153,.13);}}
+.gx-day.done b {{color:var(--green);}}
+.gx-day.rest b {{color:var(--muted);}}
+.gx-day.late {{background:rgba(255,159,67,.13);}}
+.gx-day.late b {{color:var(--orange);}}
+
+/* Chips y estados */
+.gx-chip {{display:inline-block; padding:4px 9px; border-radius:8px; background:var(--card2);
+  color:#C4CAD8; font-size:11.5px; font-weight:600; margin:6px 5px 0 0;}}
+.gx-chip.blue {{color:var(--blue); background:rgba(77,163,255,.1);}}
+.gx-chip.coral {{color:var(--coral); background:rgba(255,90,95,.1);}}
+.gx-chip.orange {{color:var(--orange); background:rgba(255,159,67,.1);}}
+.gx-badge {{display:inline-flex; align-items:center; gap:4px; padding:4px 9px; border-radius:8px; font-size:11.5px;
+  font-weight:700; white-space:nowrap;}}
+.gx-badge.ok {{background:rgba(52,211,153,.14); color:var(--green);}}
+.gx-badge.pend {{background:var(--card2); color:var(--muted);}}
+.gx-badge.skip {{background:rgba(255,159,67,.13); color:var(--orange);}}
+.gx-badge.run {{background:rgba(77,163,255,.14); color:var(--blue);}}
+
+/* Indicadores */
 .gx-kpis {{display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px;}}
 .gx-kpis.three {{grid-template-columns:repeat(3,minmax(0,1fr));}}
-.gx-kpi {{background:{C_CARD2}; border-radius:12px; padding:10px;}}
-.gx-kpi .v {{font-size:17px; font-weight:800; color:#fff; line-height:1.2; overflow-wrap:anywhere;}}
-.gx-kpi .l {{font-size:11px; color:{C_MUTED}; margin-top:2px;}}
-.gx-track {{height:9px; border-radius:6px; background:#252A38; position:relative; display:flex; overflow:hidden; margin-top:5px;}}
+.gx-kpi {{background:var(--card2); border-radius:12px; padding:10px 12px 11px;}}
+.gx-kpi .v {{font-family:var(--disp); font-size:27px; font-weight:700; color:#fff; line-height:1.05;
+  font-variant-numeric:tabular-nums; overflow-wrap:anywhere; letter-spacing:.01em;}}
+.gx-kpi .l {{font-size:11.5px; color:var(--muted); margin-top:3px; line-height:1.35;}}
+.gx-track {{height:8px; border-radius:4px; background:var(--track); position:relative; display:flex; overflow:hidden; margin-top:6px;}}
 .gx-mark {{position:absolute; top:0; bottom:0; width:2px; background:#fff; opacity:.85;}}
-.gx-bar-head {{display:flex; justify-content:space-between; font-size:12px; color:#D5DAE6; gap:6px;}}
+.gx-bar-head {{display:flex; justify-content:space-between; font-size:12.5px; color:#D5DAE6; gap:6px;}}
+.gx-bar-head .gx-num {{font-size:15px; font-weight:700; color:#fff;}}
 .gx-grid2 {{display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px;}}
-.gx-week {{background:{C_CARD}; border:1px solid {C_BORDER}; border-radius:12px; padding:10px; font-size:12px; color:#D5DAE6;}}
+.gx-week {{background:var(--card); border:1px solid var(--line); border-radius:14px; padding:12px; font-size:12px;
+  color:#D5DAE6; line-height:1.55;}}
 .gx-week b {{color:#fff;}}
-.gx-up {{color:{C_GREEN};}} .gx-down {{color:{C_ORANGE};}}
+.gx-week .wk {{font-family:var(--disp); font-size:22px; font-weight:700; color:#fff;}}
+.gx-up {{color:var(--green);}} .gx-down {{color:var(--orange);}}
+.gx-note {{color:var(--muted); font-size:12.5px; margin-top:6px; padding-left:10px; border-left:2px solid var(--line);}}
+
+/* Lista de ejercicios de la sesión */
+.gx-list-row {{display:flex; justify-content:space-between; align-items:center; gap:10px; padding:10px 0;
+  border-bottom:1px solid var(--line);}}
+.gx-list-row:last-child {{border-bottom:none;}}
+.gx-list-row .n {{font-family:var(--disp); font-size:18px; font-weight:700; color:var(--muted); width:20px; flex:none;}}
+
 /* Evaluación de sobrecarga progresiva */
-.gx-check {{font-size:12px; color:{C_MUTED}; margin-top:4px;}}
-.gx-check.ok {{color:{C_GREEN};}}
-.gx-ready {{border-color:rgba(52,211,153,.55) !important;}}
-/* Tira de la semana (sábado → viernes) */
-.gx-strip {{display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:4px; margin-top:10px;}}
-.gx-day {{background:{C_CARD2}; border-radius:10px; padding:6px 2px; text-align:center; font-size:10px; color:{C_MUTED};
-  border:1px solid transparent;}}
-.gx-day b {{display:block; font-size:12px; color:#fff;}}
-.gx-day.today {{border-color:{C_CORAL};}}
-.gx-day.done {{background:rgba(52,211,153,.15);}}
-.gx-day.done b {{color:{C_GREEN};}}
-.gx-day.rest b {{color:{C_MUTED};}}
+.gx-check {{display:flex; align-items:center; gap:7px; font-size:12.5px; color:var(--muted); margin-top:6px;}}
+.gx-check.ok {{color:var(--green);}}
+
+@media (prefers-reduced-motion: reduce) {{ * {{transition:none !important; animation:none !important;}} }}
 </style>
 """
 
@@ -1576,6 +1836,15 @@ def kpi(label, value, extra=""):
     return f'<div class="gx-kpi"><div class="v">{value}</div><div class="l">{esc(label)}{extra}</div></div>'
 
 
+def week_segments(wk):
+    """Barra de 8 segmentos: una por semana del bloque."""
+    cells = []
+    for n in range(1, WEEKS + 1):
+        cls = "done" if n < wk else ("cur" if n == wk else "")
+        cells.append(f'<div class="gx-seg {cls}"></div>')
+    return '<div class="gx-segs">' + "".join(cells) + "</div>"
+
+
 def macro_bar(label, value, goal, unit_, color):
     """Barra que NO recorta el exceso: el sobrante se pinta en coral y se muestra el % real."""
     goal = float(goal or 0)
@@ -1587,7 +1856,7 @@ def macro_bar(label, value, goal, unit_, color):
     mark = goal / scale * 100 if goal else 0
     over_txt = f" · <b style='color:{C_CORAL}'>+{value - goal:.0f} {unit_} sobre la meta</b>" if value > goal else ""
     return (f'<div style="margin-bottom:10px"><div class="gx-bar-head"><span>{esc(label)}</span>'
-            f'<span>{value:.0f} / {goal:.0f} {unit_} · {pct:.0f}%</span></div>'
+            f'<span><span class="gx-num">{value:.0f}</span> / {goal:.0f} {unit_} · {pct:.0f}%</span></div>'
             f'<div class="gx-track"><div style="width:{base_w:.1f}%;background:{color}"></div>'
             f'<div style="width:{over_w:.1f}%;background:{C_CORAL}"></div>'
             f'<div class="gx-mark" style="left:calc({mark:.1f}% - 1px)"></div></div>'
@@ -1596,7 +1865,7 @@ def macro_bar(label, value, goal, unit_, color):
 
 def overload_card(chk, title, inc, u, subtitle=""):
     """Tarjeta '¿Toca subir?' con cada criterio marcado."""
-    items = "".join(f'<div class="gx-check {"ok" if ok else ""}">{"✓" if ok else "○"} {esc(t)}</div>'
+    items = "".join(f'<div class="gx-check {"ok" if ok else ""}">{ico("check" if ok else "circle")}<span>{esc(t)}</span></div>'
                     for t, ok in chk["checks"])
     if chk["ready"]:
         verdict = badge("Sí, toca subir", "ok")
@@ -1615,7 +1884,43 @@ def plain_bar(frac, color=C_BLUE):
     return f'<div class="gx-track"><div style="width:{frac * 100:.1f}%;background:{color}"></div></div>'
 
 
-def week_strip(d, finished_dates):
+DAY_SHORT = {"Día 1: UPPER": "Upper", "Día 2: LEGS A": "Legs A", "Día 3: PUSH": "Push", "Día 4: PULL": "Pull",
+             "Día 5: LEGS B": "Legs B", "Día 6: RECUPERACIÓN": "Recup.", "Día 7: DESCANSO": "Libre"}
+
+
+def render_pending(items, prefix, exclude=()):
+    """Tarjetas de sesiones pospuestas/pendientes con acciones para retomarlas o cerrarlas."""
+    items = [p_ for p_ in items if p_["id"] not in exclude]
+    if not items:
+        return
+    for p_ in items:
+        d_ = date.fromisoformat(p_["date"])
+        meta = [f"Del {DIAS_ES[d_.weekday()]} {fecha_corta(d_)}"]
+        if p_["status"] == "postponed":
+            if p_.get("reason"):
+                meta.append(p_["reason"].lower())
+            if p_.get("postponed_to"):
+                to = date.fromisoformat(p_["postponed_to"])
+                meta.append("para hoy" if to == today() else
+                            (f"para el {DIAS_ES[to.weekday()]} {fecha_corta(to)}" if to > today()
+                             else f"programada para el {fecha_corta(to)}"))
+            tag = badge("Pospuesta", "skip")
+        else:
+            meta.append("quedó a medias")
+            tag = badge("Sin terminar", "skip")
+        frac = p_["done"] / p_["total"] if p_["total"] else 0
+        H(f'<div class="gx-card" style="border-color:rgba(255,159,67,.45)"><div class="gx-row">'
+          f'<div class="gx-title">{esc(p_["day_key"])}</div>{tag}</div>'
+          f'<div class="gx-muted">{esc(" · ".join(meta))}</div>'
+          f'<div class="gx-text">{p_["done"]} de {p_["total"]} series hechas</div>{plain_bar(frac, C_ORANGE)}</div>')
+        a, b = st.columns(2)
+        a.button("Retomar", type="primary", key=f"{prefix}_res_{p_['id']}", on_click=cb_resume_session,
+                 args=(p_["id"],), **btn_w("play_arrow"))
+        b.button("Terminar así", key=f"{prefix}_end_{p_['id']}", on_click=cb_close_pending,
+                 args=(p_["id"],), **btn_w("flag"))
+
+
+def week_strip(d, finished_dates, postponed_dates=()):
     """Tira de 7 días de la semana actual, de sábado a viernes."""
     w0 = week_start_of(d)
     cells = []
@@ -1626,17 +1931,20 @@ def week_strip(d, finished_dates):
             cls.append("today")
         if str(day_d) in finished_dates:
             cls.append("done")
+        elif str(day_d) in postponed_dates:
+            cls.append("late")
         if not DAYS[key]["exercises"]:
             cls.append("rest")
-        short = key.split(":")[1].strip()[:5] if ":" in key else key[:5]
-        cells.append(f'<div class="{" ".join(cls)}">{DIAS_ES[day_d.weekday()][:3]}<b>{day_d.day}</b>{esc(short)}</div>')
+        short = DAY_SHORT.get(key) or (key.split(":")[1].strip().title() if ":" in key else key)[:7]
+        cells.append(f'<div class="{" ".join(cls)}">{DIAS_ES[day_d.weekday()][:3]}<b>{day_d.day}</b>'
+                     f'<small>{esc(short)}</small></div>')
     return '<div class="gx-strip">' + "".join(cells) + "</div>"
 
 
 def base_layout(fig, height=280, legend=False):
     fig.update_layout(
         height=height, margin=dict(l=6, r=6, t=10, b=6), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#C4CAD8", size=11), showlegend=legend, dragmode=False,
+        font=dict(color="#C4CAD8", size=11, family="Figtree, system-ui, sans-serif"), showlegend=legend, dragmode=False,
         hoverlabel=dict(bgcolor=C_CARD2, font_color="#FFFFFF", bordercolor=C_BORDER),
         legend=dict(orientation="h", y=-0.2, x=0))
     fig.update_yaxes(gridcolor="#242938", zeroline=False, fixedrange=True, tickfont=dict(size=10))
@@ -1663,20 +1971,28 @@ def show_chart(fig, key):
 def timer_html(status, remaining, duration, label, sound):
     cls = {"done": "done", "paused": "paused"}.get(status, "")
     page = """
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@700;800&family=Figtree:wght@500;600&display=swap" rel="stylesheet">
 <style>
-body{margin:0;background:transparent;font-family:-apple-system,Segoe UI,Roboto,sans-serif;color:#F5F7FA}
-.w{background:#171B25;border:1px solid #2A2F3F;border-radius:14px;padding:10px 14px;text-align:center}
-.l{font-size:12px;color:#A0A6B8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.t{font-size:44px;font-weight:800;letter-spacing:1px;font-variant-numeric:tabular-nums;line-height:1.1;margin:2px 0 8px}
-.b{height:8px;border-radius:6px;background:#252A38;overflow:hidden}
+body{margin:0;background:transparent;font-family:Figtree,-apple-system,Segoe UI,Roboto,sans-serif;color:#F5F7FA}
+.w{background:#171B25;border:1px solid #2A2F3F;border-radius:16px;padding:12px 16px 14px;display:grid;
+  grid-template-columns:auto 1fr;column-gap:16px;align-items:center}
+.t{font-family:'Big Shoulders Display','Arial Narrow',sans-serif;font-size:68px;font-weight:800;line-height:.9;
+  font-variant-numeric:tabular-nums;letter-spacing:.01em;min-width:3.2ch}
+.side{min-width:0}
+.l{font-size:12.5px;color:#A0A6B8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.m{font-size:14px;font-weight:600;margin-top:3px;color:#F5F7FA;min-height:18px}
+.b{grid-column:1 / -1;height:6px;border-radius:3px;background:#252A38;overflow:hidden;margin-top:12px}
 .f{height:100%;width:0;background:#FF5A5F;transition:width .25s linear}
-.m{font-size:12px;margin-top:6px;color:#A0A6B8;min-height:15px}
-.done .t{color:#34D399;animation:p 1s infinite}.done .f{background:#34D399}
-.paused .t{color:#4DA3FF}.paused .f{background:#4DA3FF}
+.done{border-color:rgba(52,211,153,.6)} .done .t,.done .m{color:#34D399} .done .f{background:#34D399}
+.done .t{animation:p 1.1s ease-in-out 3}
+.paused .t,.paused .m{color:#4DA3FF} .paused .f{background:#4DA3FF}
 @keyframes p{0%,100%{opacity:1}50%{opacity:.35}}
+@media (prefers-reduced-motion: reduce){.done .t{animation:none}.f{transition:none}}
 </style>
-<div class="w __CLS__" id="w"><div class="l">__LABEL__</div><div class="t" id="t">00:00</div>
-<div class="b"><div class="f" id="f"></div></div><div class="m" id="m"></div></div>
+<div class="w __CLS__" id="w"><div class="t" id="t">00:00</div>
+<div class="side"><div class="l">__LABEL__</div><div class="m" id="m"></div></div>
+<div class="b"><div class="f" id="f"></div></div></div>
 <script>
 (function(){
 var status="__STATUS__", rem0=__REM__, dur=__DUR__, sound=__SOUND__, t0=performance.now(), fired=false;
@@ -1688,14 +2004,14 @@ function beep(){
       o.frequency.value=880;g.gain.value=0.25;o.start(c.currentTime+d);o.stop(c.currentTime+d+0.16);});} }catch(e){}
   try{ if(navigator.vibrate){navigator.vibrate([300,120,300]);} }catch(e){}
 }
-var msgs={idle:'Listo para iniciar',paused:'En pausa',done:'¡Descanso terminado!',running:''};
+var msgs={idle:'Listo para iniciar',paused:'En pausa',done:'Descanso terminado',running:'Descansando'};
 mm.textContent=msgs[status]||'';
 function tick(){
   var rem = status==='running' ? Math.max(0, rem0-(performance.now()-t0)/1000) : (status==='done'?0:rem0);
   el.textContent=fmt(rem);
   var p = (status==='idle'||dur<=0) ? 0 : (1-rem/dur)*100;
   fb.style.width=Math.min(100,Math.max(0,p))+'%';
-  if(status==='running' && rem<=0 && !fired){fired=true;w.className='w done';mm.textContent='¡Descanso terminado!';beep();}
+  if(status==='running' && rem<=0 && !fired){fired=true;w.className='w done';mm.textContent='Descanso terminado';beep();}
 }
 tick(); setInterval(tick,200);
 })();
@@ -1743,32 +2059,50 @@ def view_home():
         prog, frac = f"Semana {wk} de {WEEKS}", ((wk - 1) + (day_index(d) + 1) / 7) / WEEKS
     rest_day = not day["exercises"]
     w0 = week_start_of(d)
-    finished_dates = {str(r[0]) for r in q("SELECT date FROM sessions WHERE user_id=? AND status='finished' "
-                                             "AND date>=? AND date<=?", [UID, str(w0), str(w0 + timedelta(days=6))])}
-    H(f'<div class="gx-card"><div class="gx-muted">{esc(fecha_es(d))}</div>'
-      f'<div class="gx-h1">Hola, {esc(s.get("name", "Luis"))}</div>'
-      f'<div class="gx-row" style="margin-top:8px"><span class="gx-title">{esc(prog)}</span>'
-      f'<span class="gx-muted">{D["week_finished"]}/{SESSIONS_PER_WEEK} sesiones</span></div>{plain_bar(frac, C_BLUE)}'
-      f'{week_strip(d, finished_dates)}'
-      f'<div style="margin-top:12px" class="gx-muted">Sesión de hoy ({esc(DIAS_ES[d.weekday()])})</div>'
-      f'<div class="gx-title">{esc(day_key)}</div>'
-      f'<div class="gx-muted">{"Descanso total: recuperar también es entrenar." if rest_day else str(len(day["exercises"])) + " ejercicios"}</div></div>')
+    wk_rows = q("SELECT date, status FROM sessions WHERE user_id=? AND date>=? AND date<=?",
+                [UID, str(w0), str(w0 + timedelta(days=6))])
+    finished_dates = {str(r[0]) for r in wk_rows if r[1] == "finished"}
+    postponed_dates = {str(r[0]) for r in wk_rows if r[1] in ("postponed", "in_progress") and str(r[0]) < str(d)}
+    big = f'<div class="gx-hero-num">{wk:02d}</div>' if 1 <= wk <= WEEKS else ""
+    segs = week_segments(wk if 1 <= wk <= WEEKS else (WEEKS + 1 if wk > WEEKS else 0))
+    today_txt = ("Descanso total. Recuperar también es entrenar." if rest_day
+                 else f'{len(day["exercises"])} ejercicios · {sum(e["sets"] for e in day["exercises"])} series')
+    H(f'<div class="gx-hero">{big}<div class="gx-muted">{esc(fecha_es(d))}</div>'
+      f'<div class="gx-h1" style="margin-top:4px">Hola, {esc(s.get("name", "Luis"))}</div>'
+      f'<div class="gx-row" style="margin-top:18px"><span class="gx-title">{esc(prog)}</span>'
+      f'<span class="gx-muted">{D["week_finished"]} de {SESSIONS_PER_WEEK} sesiones</span></div>{segs}'
+      f'{week_strip(d, finished_dates, postponed_dates)}'
+      f'<div class="gx-today"><div class="gx-muted">Hoy toca</div>'
+      f'<div class="gx-title lg">{esc(day_key)}</div>'
+      f'<div class="gx-muted">{esc(today_txt)}</div></div></div>')
     if not rest_day:
         label = {None: "Comenzar entrenamiento", "in_progress": "Continuar entrenamiento",
-                 "finished": "Ver resumen de hoy"}.get(D["today_status"], "Comenzar entrenamiento")
-        st.button(label, type="primary", key="home_start", on_click=cb_start_training, args=(day_key,), **btn_w())
+                 "finished": "Ver resumen de hoy", "postponed": "Retomar entrenamiento"}.get(
+            D["today_status"], "Comenzar entrenamiento")
+        today_sid = f"{d}|{day['slug']}"
+        if D["today_status"] == "postponed":
+            st.button(label, type="primary", key="home_start", on_click=cb_resume_session, args=(today_sid,),
+                      **btn_w("play_arrow"))
+        else:
+            st.button(label, type="primary", key="home_start", on_click=cb_start_training, args=(day_key,),
+                      **btn_w("summarize" if D["today_status"] == "finished" else "play_arrow"))
+    pend = pending_sessions(ver(), str(d))
+    pend_other = [p_ for p_ in pend if p_["id"] != f"{d}|{day['slug']}"]
+    if pend_other:
+        H(f'<div class="gx-sec">Pendientes de retomar</div>')
+        render_pending(pend_other, "home")
 
     # --- semana ---
     adher = D["week_finished"] / SESSIONS_PER_WEEK * 100
-    H(f'<div class="gx-card"><div class="gx-row"><span class="gx-title">Entrenamientos de la semana</span>'
-      f'<span class="gx-muted">Adherencia {adher:.0f}%</span></div>'
-      f'<div class="gx-muted">Semana del sábado {esc(fecha_corta(w0))} al viernes {esc(fecha_corta(w0 + timedelta(days=6)))}</div>'
-      f'<div class="gx-kpis three" style="margin-top:8px">{kpi("Completados", D["week_finished"])}'
-      f'{kpi("Iniciados", D["week_started"])}{kpi("Programados", SESSIONS_PER_WEEK)}</div></div>')
+    H(f'<div class="gx-sec">Esta semana</div>'
+      f'<div class="gx-muted" style="margin:-4px 0 8px">Del sábado {esc(fecha_corta(w0))} al viernes '
+      f'{esc(fecha_corta(w0 + timedelta(days=6)))} · adherencia {adher:.0f}%</div>'
+      f'<div class="gx-kpis three">{kpi("Completados", D["week_finished"])}'
+      f'{kpi("Iniciados", D["week_started"])}{kpi("Programados", SESSIONS_PER_WEEK)}</div>')
 
     # --- nutrición ---
     cal, prot, carbs, fat = D["macros"]
-    H('<div class="gx-card" style="margin-bottom:0"><div class="gx-title">Nutrición de hoy</div></div>')
+    H('<div class="gx-sec">Nutrición de hoy</div>')
     c1, c2 = st.columns([1, 1.25])
     with c1:
         st.plotly_chart(donut(cal, T["cal"]), key="home_donut", config={"displayModeBar": False}, **plot_w())
@@ -1785,7 +2119,7 @@ def view_home():
         body_val = "%.1f kg" % D["body_avg"]
         body = kpi("Peso promedio 7 días", body_val, " · %s registros" % D["body_n"])
     else:
-        body = kpi("Peso promedio", "—", " · registra tu peso en Progreso › Cuerpo")
+        body = kpi("Peso promedio", "—", " · regístralo en Progreso, pestaña Cuerpo")
     last = D["last"]
     if last:
         lv = kg_to_unit(last[4], u)
@@ -1796,7 +2130,7 @@ def view_home():
     sleep_txt = f'{D["sleep"]:.1f} h' if D["sleep"] else "—"
     sleep_extra = f' · prom. 7d {D["sleep_avg"]:.1f} h' if D["sleep_avg"] else " · registra el sueño en Plan"
     rec_extra = (f' · energía {D["energy"]}/5 · dolor {D["soreness"]}/5' if D["energy"] is not None else "")
-    H(f'<div class="gx-grid2">{body}{lastk}{kpi("Sueño hoy", sleep_txt, sleep_extra + rec_extra)}'
+    H(f'<div class="gx-sec">Resumen</div><div class="gx-grid2">{body}{lastk}{kpi("Sueño hoy", sleep_txt, sleep_extra + rec_extra)}'
       f'{kpi("Semana del bloque", wk if 1 <= wk <= WEEKS else "—", f" de {WEEKS}")}</div>')
 
 
@@ -1809,7 +2143,7 @@ def view_food():
     st.date_input("Fecha", key="meal_date", max_value=d)
     meal_date = st.session_state["meal_date"]
     st.text_area("Registrar comida", placeholder="Ej. 150 g de pechuga asada con arroz y aguacate…", height=90, key="meal_text")
-    if st.button("✨ Analizar con IA", type="primary", key="btn_ai", **btn_w()):
+    if st.button("Analizar con IA", type="primary", key="btn_ai", **btn_w("auto_awesome")):
         text = (st.session_state.get("meal_text") or "").strip()
         if not text:
             st.warning("Escribe qué comiste.")
@@ -1830,7 +2164,7 @@ def view_food():
                     st.session_state["_manual_open"] = True
     p = st.session_state.get("pending_meal")
     if p:
-        H('<div class="gx-title" style="margin:8px 0 6px">Vista previa (aún no guardada)</div>')
+        H('<div class="gx-sec">Vista previa</div><div class="gx-muted" style="margin:-4px 0 8px">Revisa los valores antes de guardar.</div>')
         for it in p["items"]:
             H(f'<div class="gx-card" style="padding:10px"><div class="gx-row"><div><b>{esc(it["name"])}</b>'
               f'<div class="gx-muted">P {it["protein_g"]:.0f} g · C {it["carbs_g"]:.0f} g · G {it["fat_g"]:.0f} g</div></div>'
@@ -1839,8 +2173,8 @@ def view_food():
         H(f'<div class="gx-card"><div class="gx-row"><b>Total</b><b style="color:{C_ORANGE}">{e["cal"]:.0f} kcal</b></div>'
           f'<div class="gx-muted">P {e["prot"]:.0f} g · C {e["carbs"]:.0f} g · G {e["fat"]:.0f} g</div></div>')
         b1, b2 = st.columns([2, 1])
-        b1.button("Guardar comida", type="primary", key="btn_save_meal", on_click=cb_save_pending_meal, **btn_w())
-        b2.button("Descartar", key="btn_discard_meal", on_click=cb_discard_meal, **btn_w())
+        b1.button("Guardar comida", type="primary", key="btn_save_meal", on_click=cb_save_pending_meal, **btn_w("check"))
+        b2.button("Descartar", key="btn_discard_meal", on_click=cb_discard_meal, **btn_w("close"))
 
     with st.expander("Registro manual (sin IA)", expanded=st.session_state.get("_manual_open", False)):
         st.text_input("Descripción", key="mm_desc")
@@ -1850,10 +2184,10 @@ def view_food():
         c, e2 = st.columns(2)
         c.number_input("Carbohidratos (g)", 0.0, 800.0, 0.0, 1.0, key="mm_c")
         e2.number_input("Grasas (g)", 0.0, 300.0, 0.0, 1.0, key="mm_f")
-        st.button("Guardar comida manual", key="btn_manual_meal", on_click=cb_save_manual_meal, **btn_w())
+        st.button("Guardar comida manual", key="btn_manual_meal", on_click=cb_save_manual_meal, **btn_w("save"))
 
     rows = q("SELECT id, description, calories, protein_g, carbs_g, fat_g FROM meals WHERE date=? ORDER BY id", [str(meal_date)])
-    H(f'<div class="gx-title" style="margin:10px 0 6px">Comidas del {esc(fecha_corta(meal_date))}</div>')
+    H(f'<div class="gx-sec">Comidas del {esc(fecha_corta(meal_date))}</div>')
     if not rows:
         st.caption("Sin comidas registradas para este día.")
     for mid, desc, cal, pr, ca, fa in rows:
@@ -1862,7 +2196,8 @@ def view_food():
             H(f'<div class="gx-card" style="padding:10px;margin:0"><div class="gx-row"><b style="font-size:13px">{esc(desc or "Comida")}</b>'
               f'<b style="color:{C_ORANGE};white-space:nowrap">{cal:.0f} kcal</b></div>'
               f'<div class="gx-muted">P {pr:.0f} g · C {ca:.0f} g · G {fa:.0f} g</div></div>')
-        c2.button("🗑", key=f"del_meal_{mid}", on_click=cb_delete_meal, args=(mid,), **btn_w())
+        c2.button(icon_label("Borrar"), key=f"del_meal_{mid}", on_click=cb_delete_meal, args=(mid,),
+                  help="Borrar comida", **btn_w("delete"))
     if rows:
         T = get_targets(meal_date)
         tot = [sum(r[i] for r in rows) for i in (2, 3, 4, 5)]
@@ -1887,24 +2222,24 @@ def view_timer_panel(ex_name, rest_default):
         dur = t["duration"] if t["state"] != "idle" else int(S.get("rest_target", 120))
         rem = t["rem"] if t["state"] != "idle" else float(dur)
         try:
-            components.html(timer_html(t["state"], rem, dur, label, sound), height=150)
+            components.html(timer_html(t["state"], rem, dur, label, sound), height=124)
         except Exception:
             H(f'<div class="gx-card"><div class="gx-title">{esc(label)}</div><div class="gx-h1">{mmss(rem)}</div></div>')
         st_ = t["state"]
         if st_ in ("idle",):
-            st.button("▶ Iniciar descanso", type="primary", key="tm_start", on_click=cb_timer,
-                      args=("start", ex_name), **btn_w())
+            st.button("Iniciar descanso", type="primary", key="tm_start", on_click=cb_timer,
+                      args=("start", ex_name), **btn_w("play_arrow"))
         elif st_ == "running":
-            st.button("⏸ Pausar", type="primary", key="tm_pause", on_click=cb_timer, args=("pause",), **btn_w())
+            st.button("Pausar", type="primary", key="tm_pause", on_click=cb_timer, args=("pause",), **btn_w("pause"))
         elif st_ == "paused":
-            st.button("▶ Reanudar", type="primary", key="tm_resume", on_click=cb_timer, args=("resume",), **btn_w())
+            st.button("Reanudar", type="primary", key="tm_resume", on_click=cb_timer, args=("resume",), **btn_w("play_arrow"))
         else:  # done
-            st.button("▶ Nuevo descanso", type="primary", key="tm_again", on_click=cb_timer, args=("restart",), **btn_w())
+            st.button("Nuevo descanso", type="primary", key="tm_again", on_click=cb_timer, args=("restart",), **btn_w("replay"))
         if st_ != "idle":
             a, b, c = st.columns(3)
-            a.button("↺ Reiniciar", key="tm_restart", on_click=cb_timer, args=("restart",), **btn_w())
-            b.button("+30 s", key="tm_plus", on_click=cb_timer, args=("plus",), **btn_w())
-            c.button("⏹ Fin", key="tm_finish", on_click=cb_timer, args=("finish",), **btn_w())
+            a.button("Reiniciar", key="tm_restart", on_click=cb_timer, args=("restart",), **btn_w("restart_alt"))
+            b.button("30 s", key="tm_plus", on_click=cb_timer, args=("plus",), help="Sumar 30 segundos", **btn_w("add"))
+            c.button("Fin", key="tm_finish", on_click=cb_timer, args=("finish",), **btn_w("stop"))
     with st.expander("Ajustes del cronómetro"):
         st.number_input("Descanso objetivo (segundos)", 10, 900, step=15, key="rest_target",
                         on_change=keep_state, args=("rest_target", "_keep_rest"))
@@ -1982,8 +2317,9 @@ def view_exercise(day, sid, d_str, sets_df, ex, auto_rest):
     trend = ""
     if prev and last and prev["volume"]:
         pct = (last["volume"] / prev["volume"] - 1) * 100
-        trend = (f'<span class="gx-up">▲ {pct:+.0f}% volumen vs sesión previa</span>' if pct > 0.5 else
-                 f'<span class="gx-down">▼ {pct:+.0f}% volumen vs sesión previa</span>' if pct < -0.5 else "= volumen estable")
+        trend = (f'<span class="gx-up">{ico("up")} {pct:+.0f}% de volumen frente a la sesión previa</span>' if pct > 0.5 else
+                 f'<span class="gx-down">{ico("down")} {pct:+.0f}% de volumen frente a la sesión previa</span>' if pct < -0.5
+                 else f'{ico("flat")} Volumen estable')
     state_b = badge("Completado", "ok") if complete else (badge(f"{done_n}/{n_presc}", "run") if done_n else badge("Pendiente", "pend"))
     rep_txt = "Duración 15 min" if activity and ex["rmax"] == 15 else ("Sin series: marca completado" if activity else
               f'{ex["sets"]} series × {ex["rmin"]}–{ex["rmax"]} reps' if ex["rmin"] != ex["rmax"] else f'{ex["sets"]} × {ex["rmin"]}')
@@ -2014,7 +2350,7 @@ def view_exercise(day, sid, d_str, sets_df, ex, auto_rest):
                 st.markdown("<div style='height:1.6rem'></div>", unsafe_allow_html=True)
                 st.button("Confirmar", key=f"acc_{es}", on_click=cb_accept_target, type="primary",
                           args=(name, es, sid, rec["weight"],
-                                rec["last_weight"], rec["action"], rec["reason"], n_presc), **btn_w())
+                                rec["last_weight"], rec["action"], rec["reason"], n_presc), **btn_w("check"))
         if last:
             chk_last = overload_check(last, ex["rmin"], ex["rmax"], ex["sets"], ex["rir"])
             H(overload_card(chk_last, "¿Toca subir?", inc, u,
@@ -2029,10 +2365,10 @@ def view_exercise(day, sid, d_str, sets_df, ex, auto_rest):
         rid = f"{sid}|{es}|1"
         if row and row["status"] == "completed":
             H(f'<div class="gx-card" style="padding:10px"><span class="gx-badge ok">Completado</span></div>')
-            st.button("Deshacer", key=f"undo_{rid}", on_click=cb_delete_set, args=(rid,), **btn_w())
+            st.button("Deshacer", key=f"undo_{rid}", on_click=cb_delete_set, args=(rid,), **btn_w("undo"))
         else:
-            st.button("✔ Marcar completado", type="primary", key=f"ok_{rid}", on_click=cb_save_set,
-                      args=(rid, sid, d_str, name, 1, "completed", 0, False, True), **btn_w())
+            st.button("Marcar completado", type="primary", key=f"ok_{rid}", on_click=cb_save_set,
+                      args=(rid, sid, d_str, name, 1, "completed", 0, False, True), **btn_w("check"))
     else:
         for n in range(1, n_total + 1):
             rid = f"{sid}|{es}|{n}"
@@ -2060,24 +2396,28 @@ def view_exercise(day, sid, d_str, sets_df, ex, auto_rest):
                 info.append(f"Última sesión: {fmt_w(ls['w'])} × {ls['reps']}")
             extra = " · ".join(info)
             with st.container(border=True):
-                H(f'<div class="gx-row"><b>Serie {n}{" (extra)" if n > n_presc else ""}</b>{b}</div>'
+                extra_tag = ' <span class="gx-muted">extra</span>' if n > n_presc else ""
+                H(f'<div class="gx-row"><span class="gx-title" style="font-size:19px">Serie {n}'
+                  f'{extra_tag}</span>{b}</div>'
                   f'<div class="gx-muted">{esc(extra)}</div>')
                 c1, c2, c3 = st.columns(3)
                 c1.number_input(f"Peso ({u})", 0.0, 1000.0, step=float(inc), key=f"w_{rid}", format="%g")
                 c2.number_input("Reps", 0, 100, step=1, key=f"r_{rid}")
                 c3.selectbox("RIR", RIR_OPTS, key=f"i_{rid}", format_func=lambda v: "5+" if v >= 5 else str(v))
                 b1, b2, b3 = st.columns([3, 2, 1])
-                b1.button("Actualizar" if status == "completed" else "✔ Completar", key=f"ok_{rid}",
+                b1.button("Actualizar" if status == "completed" else "Completar", key=f"ok_{rid}",
                           type="secondary" if status == "completed" else "primary", on_click=cb_save_set,
-                          args=(rid, sid, d_str, name, n, "completed", rest, auto_rest), **btn_w())
-                b2.button("⏭ Omitir", key=f"skip_{rid}", on_click=cb_save_set,
-                          args=(rid, sid, d_str, name, n, "skipped", rest, auto_rest), **btn_w())
+                          args=(rid, sid, d_str, name, n, "completed", rest, auto_rest),
+                          **btn_w("sync" if status == "completed" else "check"))
+                b2.button("Omitir", key=f"skip_{rid}", on_click=cb_save_set,
+                          args=(rid, sid, d_str, name, n, "skipped", rest, auto_rest), **btn_w("skip_next"))
                 if row:
-                    b3.button("🗑", key=f"del_{rid}", on_click=cb_delete_set, args=(rid,), **btn_w())
+                    b3.button(icon_label("Borrar"), key=f"del_{rid}", on_click=cb_delete_set, args=(rid,),
+                              help="Borrar serie", **btn_w("delete"))
                 with st.expander("Nota de la serie"):
                     st.text_input("Nota", key=f"n_{rid}", label_visibility="collapsed",
                                   placeholder="Técnica, equipo, dolor, etc.")
-        st.button("＋ Añadir serie", key=f"add_{es}", on_click=cb_add_extra, args=(extra_key,), **btn_w())
+        st.button("Añadir serie", key=f"add_{es}", on_click=cb_add_extra, args=(extra_key,), **btn_w("add"))
 
     # --- resumen en tiempo real ---
     reps_t = sum(r["reps"] for r in completed)
@@ -2085,13 +2425,15 @@ def view_exercise(day, sid, d_str, sets_df, ex, auto_rest):
     rest_t = sum(r["rest_actual"] for r in completed if r["rest_actual"])
     fts = [z for z in (parse_iso(r["finished_at"]) for r in completed if r["finished_at"]) if z]
     elapsed = (max(fts) - min(fts)).total_seconds() if len(fts) >= 2 else None
+    if elapsed and elapsed > 3 * 3600:
+        elapsed = None
     cur_load = fmt_w(completed[-1]["w"]) + f" {u}" if completed else "—"
     vs = "—"
     if last and last["volume"] and completed:
         vs = f"{(vol / last['volume'] - 1) * 100:+.0f}% vol."
     next_set = next((n for n in range(1, n_total + 1) if n not in lmap), None)
     if not activity:
-        H('<div class="gx-title" style="margin:8px 0 6px">Resumen del ejercicio</div>'
+        H('<div class="gx-sec">Resumen del ejercicio</div>'
           '<div class="gx-kpis">' + kpi("Series completadas", f"{len(completed)} de {n_presc}") + kpi("Repeticiones", reps_t)
           + kpi(f"Volumen ({u}·rep)", fmt_n(vol)) + kpi("Descanso acumulado", mmss(rest_t) if rest_t else "—")
           + kpi("Tiempo del ejercicio", hms(elapsed) if elapsed else "—") + kpi("Carga actual", cur_load)
@@ -2111,13 +2453,13 @@ def view_exercise(day, sid, d_str, sets_df, ex, auto_rest):
     if complete:
         names = [e["name"] for e in day["exercises"]]
         i = names.index(name)
-        H(f'<div class="gx-card" style="margin-top:10px;border-color:rgba(52,211,153,.5)"><div class="gx-title">✓ Ejercicio completado</div>'
+        H(f'<div class="gx-card good" style="margin-top:10px"><div class="gx-title gx-up">{ico("check", size=18)} Ejercicio completado</div>'
           f'<div class="gx-text">{len(completed)} series · {reps_t} repeticiones · {fmt_n(vol)} {u}·rep'
           f'{" · " + vs + " vs la última sesión" if vs != "—" else ""}</div></div>')
         if i + 1 < len(names):
             rests = {e["name"]: rest_for(e) for e in day["exercises"]}
-            st.button("Siguiente ejercicio ▶", type="primary", key=f"next_{es}", on_click=cb_set_exercise,
-                      args=(day["slug"], names), kwargs=dict(step=1, rests=rests), **btn_w())
+            st.button("Siguiente ejercicio", type="primary", key=f"next_{es}", on_click=cb_set_exercise,
+                      args=(day["slug"], names), kwargs=dict(step=1, rests=rests), **btn_w("arrow_forward"))
 
     # --- historial / técnica / ajustes ---
     if st.toggle("Ver historial", key=f"hist_{es}"):
@@ -2138,7 +2480,7 @@ def view_exercise(day, sid, d_str, sets_df, ex, auto_rest):
             a, b = st.columns(2)
             a.number_input("Descanso (s)", 0, 600, step=15, key=f"cfg_rest_{es}")
             b.number_input(f"Incremento mínimo ({u})", 0.25, 50.0, step=0.25, key=f"cfg_inc_{es}", format="%g")
-            st.button("Guardar ajustes", key=f"cfgsave_{es}", on_click=cb_save_ex_cfg, args=(name, es, u), **btn_w())
+            st.button("Guardar ajustes", key=f"cfgsave_{es}", on_click=cb_save_ex_cfg, args=(name, es, u), **btn_w("save"))
 
 
 def session_summary(df_all, sid, d, u):
@@ -2169,11 +2511,10 @@ def session_summary(df_all, sid, d, u):
 
 
 def view_session_done(sid, sess, d, u):
-    st_ = parse_iso(sess["started_at"])
-    en = parse_iso(sess["finished_at"])
-    dur = (en - st_).total_seconds() if st_ and en else 0
+    dur = session_active_seconds(sess) if sess.get("finished_at") else 0
     S = session_summary(all_sets_df(ver()), sid, d, u)
-    prs = "".join(f'<div class="gx-text">🏅 <b>{esc(e)}</b>: {esc(t)}</div>' for e, t in S["prs"]) or \
+    prs = "".join(f'<div class="gx-text" style="color:{C_ORANGE}">{ico("trophy", C_ORANGE)} <b style="color:#fff">{esc(e)}</b>: {esc(t)}</div>'
+                  for e, t in S["prs"]) or \
         '<div class="gx-muted">Sin récords nuevos en esta sesión.</div>'
     diff = ""
     if S["prev"]:
@@ -2181,7 +2522,7 @@ def view_session_done(sid, sess, d, u):
         pct = f" ({dv / S['prev']['volume'] * 100:+.0f}%)" if S["prev"]["volume"] else ""
         diff = (f'<div class="gx-text">vs sesión del {esc(fecha_corta(S["prev"]["date"]))}: '
                 f'{sign(S["sets"] - S["prev"]["sets"])} series · {sign(dv, 0)} {u}·rep{pct}</div>')
-    H(f'<div class="gx-card" style="border-color:rgba(52,211,153,.5)"><div class="gx-title">Sesión finalizada</div>'
+    H(f'<div class="gx-card good"><div class="gx-title lg">Sesión finalizada</div>'
       f'<div class="gx-kpis" style="margin-top:8px">{kpi("Duración", hms(dur))}{kpi("Ejercicios", S["exercises"])}'
       f'{kpi("Series completadas", S["sets"])}{kpi("Repeticiones", S["reps"])}'
       f'{kpi(f"Volumen ({u}·rep)", fmt_n(S["volume"]))}</div>{diff}<div style="margin-top:8px">{prs}</div></div>')
@@ -2198,10 +2539,10 @@ def view_session_done(sid, sess, d, u):
                 continue
             chk = overload_check(ss_[-1], e["rmin"], e["rmax"], e["sets"], e["rir"])
             if chk["ready"]:
-                up.append(f'<div class="gx-text">⬆ <b>{esc(e["name"])}</b>: {fmt_w(chk["weight"])} → '
+                up.append(f'<div class="gx-text gx-up">{ico("up")} <b style="color:#fff">{esc(e["name"])}</b>: {fmt_w(chk["weight"])} → '
                           f'<b>{fmt_w(chk["weight"] + inc_for(e, u))} {u}</b></div>')
             else:
-                keep.append(f'<div class="gx-muted" style="margin-top:4px">= {esc(e["name"])}: mantén {fmt_w(chk["weight"])} {u} '
+                keep.append(f'<div class="gx-muted" style="margin-top:6px">{ico("flat")} {esc(e["name"])}: mantén {fmt_w(chk["weight"])} {u} '
                             f'({min(chk["at_top"], e["sets"])} de {e["sets"]} series en el tope)</div>')
         if up or keep:
             up_html = "".join(up) or '<div class="gx-muted">Ningún ejercicio cumple aún para subir.</div>'
@@ -2209,25 +2550,83 @@ def view_session_done(sid, sess, d, u):
               f'{up_html}'
               f'{"".join(keep)}<div class="gx-muted" style="margin-top:8px">La subida se confirma en la próxima '
               f'sesión; la app nunca cambia la carga sola.</div></div>')
-    st.button("Reabrir sesión", key="reopen", on_click=cb_reopen_session, args=(sid,), **btn_w())
+    st.button("Reabrir sesión", key="reopen", on_click=cb_reopen_session, args=(sid,), **btn_w("lock_open"))
+
+
+def view_postpone_panel(sid, sets_df):
+    """Opción para dejar el resto del entrenamiento para otro día."""
+    done = int((sets_df["status"] == "completed").sum()) if not sets_df.empty else 0
+    with st.expander("Posponer entrenamiento"):
+        st.caption(f"Se guardan las {done} series que ya hiciste. Cuando la retomes, continúas justo donde te quedaste; "
+                   "la sesión conserva su fecha original para el historial y la progresión.")
+        init_state("pp_reason", POSTPONE_REASONS[0])
+        st.selectbox("Motivo", POSTPONE_REASONS, key="pp_reason")
+        init_state("pp_date", today() + timedelta(days=1))
+        if st.session_state["pp_date"] < today():
+            st.session_state["pp_date"] = today()
+        st.date_input("Retomar el", key="pp_date", min_value=today())
+        st.text_input("Nota (opcional)", key="pp_note", placeholder="Ej. mareo a mitad de la sesión")
+        if st.session_state.get("pp_reason") in ("Me sentí mal", "Dolor o molestia"):
+            st.caption("Si el malestar es fuerte o no se va, descansa y consúltalo con un médico antes de volver a entrenar.")
+        st.button("Posponer", key=f"pp_btn_{sid}", on_click=cb_postpone_session, args=(sid,), **btn_w("schedule"))
+
+
+def view_postponed_card(sess, day_key):
+    d_ = date.fromisoformat(sess["date"])
+    to = date.fromisoformat(sess["postponed_to"]) if sess.get("postponed_to") else None
+    r = q1("SELECT COUNT(*) FROM sets_log WHERE session_id=? AND status IN ('completed','skipped')", [sess["id"]])
+    total = sum(e["sets"] for e in DAYS[day_key]["exercises"])
+    done = r[0] if r else 0
+    when = f" Programada para el {DIAS_ES[to.weekday()]} {fecha_corta(to)}." if to else ""
+    H(f'<div class="gx-card" style="border-color:rgba(255,159,67,.45)"><div class="gx-row">'
+      f'<div class="gx-title lg">{esc(day_key)}</div>{badge("Pospuesta", "skip")}</div>'
+      f'<div class="gx-muted">Del {DIAS_ES[d_.weekday()]} {fecha_corta(d_)} · {esc((sess.get("postpone_reason") or "").lower())}</div>'
+      f'<div class="gx-text">{done} de {total} series hechas.{esc(when)}</div>'
+      f'{plain_bar(done / total if total else 0, C_ORANGE)}</div>')
+    a, b = st.columns(2)
+    a.button("Retomar ahora", type="primary", key=f"res_now_{sess['id']}", on_click=cb_resume_session,
+             args=(sess["id"],), **btn_w("play_arrow"))
+    b.button("Terminar así", key=f"end_now_{sess['id']}", on_click=cb_close_pending,
+             args=(sess["id"],), **btn_w("flag"))
 
 
 def view_workout():
     flash_show()
     u = unit()
     d = today()
-    init_state("day_pick", st.session_state.get("_keep_day", suggested_day()))
-    if st.session_state["day_pick"] not in DAYS:
-        st.session_state["day_pick"] = suggested_day()
-    day_key = st.selectbox("Sesión", DAY_KEYS, key="day_pick",
-                           format_func=lambda k: f"{k} · {weekday_name_for(k)}",
-                           on_change=keep_state, args=("day_pick", "_keep_day"))
-    if day_key != suggested_day():
-        st.caption(f"Hoy ({DIAS_ES[d.weekday()]}) toca {suggested_day()}. Estás registrando otra sesión con fecha de hoy.")
-    day = DAYS[day_key]
-    sid, d_str = f"{d}|{day['slug']}", str(d)
+    S = st.session_state
+    resumed = None
+    if S.get("active_sid"):
+        rs = get_session(S["active_sid"])
+        if rs and rs["status"] == "in_progress" and rs["day_name"] in DAYS and rs["date"] != str(d):
+            resumed = rs
+        else:
+            S.pop("active_sid", None)
+
+    if resumed:
+        day_key = resumed["day_name"]
+        day = DAYS[day_key]
+        sid, d_str = resumed["id"], resumed["date"]
+        d = date.fromisoformat(d_str)
+        H(f'<div class="gx-card flat" style="padding:12px 14px"><div class="gx-muted">Retomando la sesión del '
+          f'{DIAS_ES[d.weekday()]} {fecha_corta(d)}. Las series se guardan con esa fecha.</div></div>')
+        st.button("Ir a la sesión de hoy", key="back_today", on_click=cb_back_today, **btn_w("today"))
+    else:
+        render_pending(pending_sessions(ver(), str(d)), "rut", exclude={f"{d}|{DAYS[S.get('day_pick', suggested_day())]['slug']}"}
+                       if S.get("day_pick") in DAYS else ())
+        init_state("day_pick", S.get("_keep_day", suggested_day()))
+        if S["day_pick"] not in DAYS:
+            S["day_pick"] = suggested_day()
+        day_key = st.selectbox("Sesión", DAY_KEYS, key="day_pick",
+                               format_func=lambda k: f"{k} · {weekday_name_for(k)}",
+                               on_change=keep_state, args=("day_pick", "_keep_day"))
+        if day_key != suggested_day():
+            st.caption(f"Hoy ({DIAS_ES[d.weekday()]}) toca {suggested_day()}. Estás registrando otra sesión con fecha de hoy.")
+        day = DAYS[day_key]
+        sid, d_str = f"{d}|{day['slug']}", str(d)
     if not day["exercises"]:
-        st.info("Hoy es día de recuperación total. Duerme bien, hidrátate y cumple tus metas de proteína. 💪")
+        H('<div class="gx-card"><div class="gx-title lg">Descanso total</div><div class="gx-text">Duerme bien, '
+          'hidrátate y cumple tu meta de proteína. La recuperación también cuenta.</div></div>')
         return
     sess = get_session(sid)
     if not sess:
@@ -2240,20 +2639,24 @@ def view_workout():
             chk = overload_check(ss_[-1], e["rmin"], e["rmax"], e["sets"], e["rir"])
             if not chk["ready"]:
                 return ""
-            return (f'<div style="font-size:11px;color:{C_GREEN}">⬆ Toca subir: '
+            return (f'<div style="font-size:11.5px;color:{C_GREEN};margin-top:2px">{ico("up", size=12)} Toca subir: '
                     f'{fmt_w(chk["weight"])} → {fmt_w(chk["weight"] + inc_for(e, u))} {u}</div>')
         rows = "".join(
-            f'<div class="gx-row" style="padding:6px 0;border-bottom:1px solid {C_BORDER}"><div><span style="font-size:13px">{esc(e["name"])}</span>'
-            f'{up_tag(e)}</div><span class="gx-muted" style="white-space:nowrap">{esc(presc_text(e))}</span></div>'
-            for e in day["exercises"])
-        H(f'<div class="gx-card"><div class="gx-title">{esc(day_key)}</div><div class="gx-muted">{len(day["exercises"])} ejercicios · '
-          f'{esc(weekday_name_for(day_key))}</div>{rows}</div>')
+            f'<div class="gx-list-row"><span class="n">{i}</span><div style="flex:1;min-width:0">'
+            f'<div style="font-size:14px;font-weight:600">{esc(e["name"])}</div>{up_tag(e)}</div>'
+            f'<span class="gx-muted" style="white-space:nowrap">{esc(presc_text(e))}</span></div>'
+            for i, e in enumerate(day["exercises"], 1))
+        H(f'<div class="gx-card"><div class="gx-title lg">{esc(day_key)}</div><div class="gx-muted">{len(day["exercises"])} ejercicios · '
+          f'{esc(weekday_name_for(day_key))}</div><div style="margin-top:8px">{rows}</div></div>')
         st.button("Comenzar entrenamiento", type="primary", key="start_session", on_click=cb_start_training,
-                  args=(day_key, False), **btn_w())
+                  args=(day_key, False), **btn_w("play_arrow"))
         return
 
     if sess["status"] == "finished":
         view_session_done(sid, sess, d, u)
+        return
+    if sess["status"] == "postponed":
+        view_postponed_card(sess, day_key)
         return
 
     sets_df = session_sets(sid)
@@ -2262,9 +2665,8 @@ def view_workout():
     comp_n = len(comp)
     prog_n = sum(e["sets"] for e in day["exercises"])
     vol = kg_to_unit(float((comp["weight_kg"] * comp["reps"]).sum()), u) if comp_n else 0.0
-    st_dt = parse_iso(sess["started_at"])
-    elapsed = (now() - st_dt).total_seconds() if st_dt else 0
-    H(f'<div class="gx-card"><div class="gx-row"><div class="gx-title">{esc(day_key)}</div>{badge("En curso", "run")}</div>'
+    elapsed = session_active_seconds(sess, end=now())
+    H(f'<div class="gx-card"><div class="gx-row"><div class="gx-title lg">{esc(day_key)}</div>{badge("En curso", "run")}</div>'
       f'<div class="gx-kpis three" style="margin-top:8px">{kpi("Series", f"{comp_n}/{prog_n}")}'
       f'{kpi("Tiempo", hms(elapsed))}{kpi(f"Vol. ({u}·rep)", fmt_n(vol))}</div>'
       f'{plain_bar(comp_n / prog_n if prog_n else 0, C_BLUE)}</div>')
@@ -2281,13 +2683,13 @@ def view_workout():
         st.session_state[pick_key] = first_open
     rests = {e["name"]: rest_for(e) for e in day["exercises"]}
     n1, n2, n3 = st.columns([1, 5, 1])
-    n1.button("◀", key="ex_prev", on_click=cb_set_exercise, args=(day["slug"], names),
-              kwargs=dict(step=-1, rests=rests), **btn_w())
+    n1.button(icon_label("<"), key="ex_prev", on_click=cb_set_exercise, args=(day["slug"], names),
+              kwargs=dict(step=-1, rests=rests), help="Ejercicio anterior", **btn_w("chevron_left"))
     n2.selectbox("Ejercicio", names, key=pick_key, label_visibility="collapsed",
                  format_func=lambda n_: f"{names.index(n_) + 1}. {n_} · {done_by_ex.get(n_, 0)}/{next(e['sets'] for e in day['exercises'] if e['name'] == n_)}",
                  on_change=cb_set_exercise, args=(day["slug"], names), kwargs=dict(rests=rests))
-    n3.button("▶", key="ex_next", on_click=cb_set_exercise, args=(day["slug"], names),
-              kwargs=dict(step=1, rests=rests), **btn_w())
+    n3.button(icon_label(">"), key="ex_next", on_click=cb_set_exercise, args=(day["slug"], names),
+              kwargs=dict(step=1, rests=rests), help="Ejercicio siguiente", **btn_w("chevron_right"))
     ex = next(e for e in day["exercises"] if e["name"] == st.session_state[pick_key])
 
     view_timer_panel(ex["name"], rest_for(ex))
@@ -2298,7 +2700,8 @@ def view_workout():
     if pending:
         st.caption(f"Quedan {pending} ejercicio(s) con series sin registrar.")
     st.button("Finalizar entrenamiento", type="primary", key="finish_session", on_click=cb_finish_session,
-              args=(sid,), **btn_w())
+              args=(sid,), **btn_w("flag"))
+    view_postpone_panel(sid, sets_df)
 
 
 # =============================================================================
@@ -2333,7 +2736,7 @@ def view_loads(df_all, u):
     style_time_axis(fig, dates)
     show_chart(fig, "ch_load")
     if rng[0] > 0:
-        st.caption("⚠ El eje vertical no empieza en cero para que los cambios pequeños se vean; revisa los valores exactos al tocar cada punto.")
+        st.caption("El eje vertical no empieza en cero para que los cambios pequeños se vean. Toca cada punto para ver el valor exacto.")
     fig2 = go.Figure(go.Bar(x=dates, y=[s["volume"] for s in ss], marker_color=C_BLUE,
                             hovertemplate="<b>%{x|%d/%m/%Y}</b><br>Volumen: %{y:,.0f} " + u + "·rep<extra></extra>"))
     base_layout(fig2, 220)
@@ -2372,7 +2775,7 @@ def view_compare(df_all, u):
     H(f'<div class="gx-card" style="margin-top:10px"><div class="gx-title">{esc(c["verdict"])}</div>'
       f'<div class="gx-kpis three" style="margin-top:8px">{kpi("Δ Carga", sign(c["dw"], 2, " " + u))}{kpi("Δ Reps", sign(c["dreps"]))}'
       f'{kpi("Δ Volumen", sign(c["dvol"], 0) + pct)}{kpi("Δ RIR", rir)}{kpi("Δ Series", sign(c["dsets"]))}</div>'
-      + "".join(f'<div class="gx-muted" style="margin-top:6px">• {esc(n)}</div>' for n in c["notes"]) + "</div>")
+      + "".join(f'<div class="gx-note">{esc(n)}</div>' for n in c["notes"]) + "</div>")
     ex = next((e for dd in DAYS.values() for e in dd["exercises"] if e["name"] == pick), None)
     if ex:
         r = recommend(ss, ex["rmin"], ex["rmax"], ex["sets"], ex["rir"], inc_for(ex, u))
@@ -2449,7 +2852,7 @@ def view_block(df_all, u):
         notes = ("; ".join(w["notes"])[:80]) if w["notes"] else "—"
         w_end = w["start"] + timedelta(days=6)
         cards.append(
-            f'<div class="gx-week"><div class="gx-row"><b>Semana {w["n"]}</b>{badge(w["status"], kind)}</div>'
+            f'<div class="gx-week"><div class="gx-row"><span class="wk">Semana {w["n"]}</span>{badge(w["status"], kind)}</div>'
             f'<div class="gx-muted">sáb {esc(fecha_corta(w["start"]))} – vie {esc(fecha_corta(w_end))}'
             f'{" · actual" if w["n"] == cur_wk else ""}</div>'
             f'Sesiones <b>{w["finished"]}/{SESSIONS_PER_WEEK}</b> · Adh. <b>{w["adherence"]:.0f}%</b><br>'
@@ -2463,10 +2866,10 @@ def view_block(df_all, u):
         wk_sel = st.selectbox("Semana", list(range(1, WEEKS + 1)), key="wk_close_sel")
         is_closed = weeks[wk_sel - 1]["closed"]
         st.button("Reabrir semana" if is_closed else "Marcar como completada", key="wk_close_btn", on_click=cb_week,
-                  args=(wk_sel, not is_closed), **btn_w())
+                  args=(wk_sel, not is_closed), **btn_w("lock_open" if is_closed else "task_alt"))
         st.caption("Una semana solo figura como completada cuando terminas sus 6 sesiones o la cierras tú.")
 
-    st.markdown("##### Gráficas semanales")
+    H('<div class="gx-sec">Gráficas semanales</div>')
     metrics = ["Press de banca", "Sentadilla", "Remo en polea baja", "Curl femoral", "Peso corporal", "Cintura",
                "Series por grupo muscular", "Adherencia"]
     m = st.selectbox("Métrica", metrics, key="blk_metric")
@@ -2495,7 +2898,7 @@ def view_block(df_all, u):
         fig.update_xaxes(range=[xs[0] - pd.Timedelta(days=3), xs[-1] + pd.Timedelta(days=3)])
         show_chart(fig, key)
         if rng[0] > 0:
-            st.caption("⚠ Eje vertical truncado: no empieza en cero. Toca los puntos para ver valores exactos.")
+            st.caption("El eje vertical no empieza en cero. Toca los puntos para ver los valores exactos.")
 
     def top_series(names):
         out = []
@@ -2541,13 +2944,13 @@ def view_block(df_all, u):
 
 def view_body():
     d = today()
-    H('<div class="gx-title" style="margin-bottom:6px">Registrar medidas</div>')
+    H('<div class="gx-sec" style="margin-top:6px">Registrar medidas</div>')
     a, b, c = st.columns(3)
     init_state("bd_date", d)
     a.date_input("Fecha", key="bd_date", max_value=d)
     b.number_input("Peso (kg)", 0.0, 300.0, 0.0, 0.1, key="bd_w", format="%g")
     c.number_input("Cintura (cm)", 0.0, 250.0, 0.0, 0.5, key="bd_waist", format="%g")
-    st.button("Guardar medidas", key="bd_save", on_click=cb_save_body, **btn_w())
+    st.button("Guardar medidas", key="bd_save", on_click=cb_save_body, **btn_w("save"))
     st.caption("Deja en 0 el dato que no quieras registrar; no se sobrescribe lo ya guardado.")
     bd = body_df(ver())
     if bd.empty:
@@ -2637,10 +3040,10 @@ def view_export():
         except Exception:
             continue
         bundle[name] = json.loads(df.to_json(orient="records", force_ascii=False))
-        st.download_button(f"⬇ {name}.csv ({len(df)} filas)", df.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"gains_{name}.csv", mime="text/csv", key=f"dl_{name}", **dl_w())
-    st.download_button("⬇ Todo en JSON", json.dumps(bundle, ensure_ascii=False, indent=1).encode("utf-8"),
-                       file_name=f"gains_backup_{today()}.json", mime="application/json", key="dl_json", **dl_w())
+        st.download_button(f"{name}.csv · {len(df)} filas", df.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"gains_{name}.csv", mime="text/csv", key=f"dl_{name}", **dl_w("download"))
+    st.download_button("Todo en JSON", json.dumps(bundle, ensure_ascii=False, indent=1).encode("utf-8"),
+                       file_name=f"gains_backup_{today()}.json", mime="application/json", key="dl_json", **dl_w("download"))
 
 
 def view_progress():
@@ -2667,7 +3070,7 @@ def view_progress():
 def view_plan():
     d, u = today(), unit()
     T = get_targets(d)
-    H('<div class="gx-title" style="margin-bottom:6px">Metas nutricionales y sueño</div>')
+    H('<div class="gx-sec" style="margin-top:6px">Metas nutricionales y sueño</div>')
     r = q1("SELECT sleep_hours FROM daily_metrics WHERE date=?", [str(d)])
     sleep_today = float(r[0]) if r and r[0] is not None else 0.0
     with st.form("goals_form"):
@@ -2681,7 +3084,7 @@ def view_plan():
         st.form_submit_button("Guardar metas", type="primary", on_click=cb_save_goals, **fsb_w())
     st.caption("Las metas se heredan a los días siguientes hasta que las cambies.")
 
-    H('<div class="gx-title" style="margin:14px 0 6px">Recuperación de hoy</div>')
+    H('<div class="gx-sec">Recuperación de hoy</div>')
     rr = q1("SELECT energy, soreness, notes FROM recovery_log WHERE user_id=? AND date=?", [UID, str(d)])
     with st.form("rec_form"):
         st.number_input("Sueño (h)", 0.0, 16.0, sleep_today, 0.5, key="rc_sleep")
@@ -2691,20 +3094,19 @@ def view_plan():
         st.text_input("Observaciones", rr[2] if rr and rr[2] else "", key="rc_notes")
         st.form_submit_button("Guardar recuperación", on_click=cb_save_recovery, **fsb_w())
 
-    H('<div class="gx-title" style="margin:14px 0 6px">Bloque de entrenamiento</div>')
+    H('<div class="gx-sec">Bloque de entrenamiento</div>')
     start = program_start()
     st.date_input("Inicio del bloque (se ajusta al sábado de esa semana)", start, key="pl_start")
-    st.button("Guardar inicio del bloque", key="pl_start_btn", on_click=cb_save_program, **btn_w())
+    st.button("Guardar inicio del bloque", key="pl_start_btn", on_click=cb_save_program, **btn_w("event"))
     wk = week_number(d)
     st.caption(f"Hoy es la semana {wk} de {WEEKS} (semanas de sábado a viernes)." if 1 <= wk <= WEEKS else
                "El bloque aún no inicia." if wk < 1 else "El bloque de 8 semanas ya terminó.")
     sched = "".join(
-        f'<div class="gx-row" style="padding:5px 0;border-bottom:1px solid {C_BORDER}">'
-        f'<span style="font-size:13px">{esc(weekday_name_for(k).capitalize())}</span>'
+        f'<div class="gx-list-row"><span style="font-size:13.5px;font-weight:600">{esc(weekday_name_for(k).capitalize())}</span>'
         f'<span class="gx-muted">{esc(k)}</span></div>' for k in DAY_KEYS)
     H(f'<div class="gx-card" style="margin-top:8px"><div class="gx-title">Calendario semanal</div>{sched}</div>')
 
-    H('<div class="gx-title" style="margin:14px 0 6px">Preferencias</div>')
+    H('<div class="gx-sec">Preferencias</div>')
     init_state("pl_unit", u)
     st.selectbox("Unidad de peso", ["kg", "lb"], key="pl_unit", on_change=cb_unit_change)
     init_state("pl_name", settings().get("name", "Luis"))
@@ -2712,21 +3114,26 @@ def view_plan():
     st.caption("Al cambiar de unidad, los registros guardados se convierten para mostrarse; los incrementos mínimos por ejercicio vuelven a sus valores por defecto.")
     mode = db().mode
     st.caption("Almacenamiento: Turso (persistente)." if mode == "turso" else
-               "⚠ Almacenamiento local temporal: configura TURSO_DATABASE_URL y TURSO_AUTH_TOKEN para no perder datos.")
+               "Almacenamiento local temporal: configura TURSO_DATABASE_URL y TURSO_AUTH_TOKEN para no perder datos.")
 
 
 # =============================================================================
 # 18. MAIN
 # =============================================================================
 def main():
-    st.set_page_config(page_title="Gains OS", page_icon="🏋", layout="centered", initial_sidebar_state="collapsed")
+    st.set_page_config(page_title="Gains OS", page_icon=page_icon(), layout="centered", initial_sidebar_state="collapsed")
     st.markdown(CSS, unsafe_allow_html=True)
     try:
         db()
     except Exception as e:
         st.error(f"No se pudo conectar a la base de datos: {e}")
         st.stop()
+    # Versión de caché única por visita: al recargar la página no se reutilizan datos viejos.
+    init_state("_ver", int(time.time() * 1000))
+    init_state("_hver", int(time.time() * 1000))
     init_state("nav", NAV[0])
+    if st.session_state.get("nav") not in NAV:
+        st.session_state["nav"] = NAV[0]
     try:
         nav_box = st.container(key="topnav")
     except TypeError:
